@@ -179,8 +179,10 @@ Function AddToUserPath
       WriteRegExpandStr HKCU "Environment" "Path" "$0;$INSTDIR"
     ${EndIf}
   ${EndIf}
-  ; Notify running processes (Explorer picks it up for newly launched apps)
-  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  ; Notify running processes (Explorer picks it up for newly launched apps).
+  ; SendNotifyMessage is fire-and-forget: SendMessage broadcast can hang for
+  ; minutes when any top-level window's UI thread is wedged.
+  System::Call 'user32::SendNotifyMessage(i 0xFFFF, i ${WM_SETTINGCHANGE}, i 0, t "Environment")'
 FunctionEnd
 
 ; --- Remove $INSTDIR from the user PATH ---
@@ -212,5 +214,5 @@ Function un.RemoveFromUserPath
     DeleteRegValue HKCU "Environment" "Path"
   ${EndIf}
   notify:
-    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+    System::Call 'user32::SendNotifyMessage(i 0xFFFF, i ${WM_SETTINGCHANGE}, i 0, t "Environment")'
 FunctionEnd
