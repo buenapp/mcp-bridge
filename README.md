@@ -18,13 +18,17 @@ CA root store**.
 mcp-bridge.exe <url> [--header "Name: Value"]... [--verbose]
 ```
 
+The installer puts `mcp-bridge.exe` in `%LOCALAPPDATA%\Programs\MCP Bridge`
+and adds that directory to the user `PATH`, so clients can invoke it by name
+(restart the client after installing so it picks up the new `PATH`).
+
 Example `mcp_config.json` entry:
 
 ```json
 {
   "mcpServers": {
     "example": {
-      "command": "C:\\tools\\mcp-bridge.exe",
+      "command": "mcp-bridge.exe",
       "args": ["https://mcp.example.com/mcp"]
     }
   }
@@ -42,7 +46,7 @@ This bridge targets stdio-only clients like Claude Desktop
 {
   "mcpServers": {
     "example": {
-      "command": "C:\\tools\\mcp-bridge.exe",
+      "command": "mcp-bridge.exe",
       "args": ["https://mcp.example.com/mcp"]
     }
   }
