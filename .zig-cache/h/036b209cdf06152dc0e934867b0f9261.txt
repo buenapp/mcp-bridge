@@ -835,6 +835,6 @@
 24293 6891178 1760154801000000000 0c7d3ee9ea8e698a843ee6039fd161c4 1 std/os/linux/bpf/helpers.zig
 3221 6819393 1760154801000000000 fda67b74062c7f535bb0a6d0f1fe74fb 1 std/crypto/codecs/asn1/der/ArrayListReverse.zig
 3977 1293465 1786145872727937000 24abe4272ef067f9049588c8fb52305c 0 /home/admin/Documents/Projects/McpBridge/src/test_main.zig
-9264 1293463 1786145375377730000 7167134f7a50e338e6313856e7a5b53d 0 /home/admin/Documents/Projects/McpBridge/src/dane.zig
+10999 1293463 1786148860519981000 4b283a21319d2a091c05404814efe8ea 0 /home/admin/Documents/Projects/McpBridge/src/dane.zig
 1736 1292004 1786145704657458000 0fe0e3ba81ce4d4d3f1fa3e1ad5ac27f 0 /home/admin/Documents/Projects/McpBridge/src/mcp.zig
-13882 1292109 1786148677632242000 90e70edb865dd3e62b0400fc16941a2b 0 /home/admin/Documents/Projects/McpBridge/src/win.zig
+14421 1292109 1786149129578500000 ae8ab4906002183f02e032a74aec3fcb 0 /home/admin/Documents/Projects/McpBridge/src/win.zig

@@ -31,6 +31,7 @@ pub const TlsError = error{
     PkiValidationFailed,
     TlsClosed,
     TlsError,
+    Timeout,
     OutOfMemory,
     Utf16Conversion,
 };
@@ -86,7 +87,10 @@ pub const TlsStream = struct {
             var tmp: [16384]u8 = undefined;
             const n = ws2.recv(self.sock, tmp[0..].ptr, @intCast(tmp.len), 0);
             if (n == 0) return 0; // TCP closed
-            if (n == ws2.SOCKET_ERROR) return TlsError.TlsError;
+            if (n == ws2.SOCKET_ERROR) {
+                if (@intFromEnum(ws2.WSAGetLastError()) == win.WSAETIMEDOUT) return TlsError.Timeout;
+                return TlsError.TlsError;
+            }
             self.enc_buf.appendSlice(self.alloc, tmp[0..@intCast(n)]) catch return TlsError.OutOfMemory;
         }
     }
@@ -276,6 +280,7 @@ pub fn connect(
         _ = ws2.closesocket(s);
     }
     if (!connected) return TlsError.ConnectFailed;
+    win.setTimeouts(stream.sock, 30_000, 15_000);
     vprint("mcp-bridge: [tls] tcp connected\n", .{});
 
     // Acquire credentials (manual validation — we verify ourselves)

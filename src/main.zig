@@ -162,38 +162,115 @@ fn writeStdout(bytes: []const u8) !void {
     }
 }
 
-fn serveRequest(
+const Conn = union(enum) {
+    tls: schannel.TlsStream,
+    plain: plain.PlainStream,
+
+    fn deinit(self: *Conn) void {
+        switch (self.*) {
+            inline else => |*s| s.deinit(),
+        }
+    }
+};
+
+/// Owns the persistent upstream connection, session id, and verifier.
+const Bridge = struct {
     alloc: std.mem.Allocator,
     cfg: *const Config,
     verifier: ?*Verifier,
-    session_id: *?[]const u8,
-    line: []const u8,
-) !http.Response {
-    const t = cfg.target;
+    conn: ?Conn = null,
+    session_id: ?[]const u8 = null,
 
-    // Assemble headers: user headers + session/protocol headers
-    var headers: std.ArrayList([]const u8) = .empty;
-    defer headers.deinit(alloc);
-    try headers.appendSlice(alloc, cfg.headers.items);
-    if (session_id.*) |sid| {
-        const h = try std.fmt.allocPrint(alloc, "MCP-Session-Id: {s}", .{sid});
-        try headers.append(alloc, h);
+    fn deinit(self: *Bridge) void {
+        self.closeConn();
+        if (self.session_id) |sid| self.alloc.free(@constCast(sid));
     }
-    try headers.append(alloc, "MCP-Protocol-Version: 2025-03-26");
-    defer for (headers.items[cfg.headers.items.len..]) |h| {
-        if (!std.mem.eql(u8, h, "MCP-Protocol-Version: 2025-03-26")) alloc.free(@constCast(h));
-    };
 
-    if (t.secure) {
-        var tls = try schannel.connect(alloc, t.host, t.port, @ptrCast(verifier.?), Verifier.verifyOpaque);
-        defer tls.deinit();
-        return try http.post(alloc, &tls, t.host, t.path, line, headers.items);
-    } else {
-        var ps = try plain.PlainStream.connect(alloc, t.host, t.port);
-        defer ps.deinit();
-        return try http.post(alloc, &ps, t.host, t.path, line, headers.items);
+    fn closeConn(self: *Bridge) void {
+        if (self.conn) |*c| {
+            switch (c.*) {
+                .tls => |*s| s.closeNotify(),
+                .plain => {},
+            }
+            c.deinit();
+            self.conn = null;
+        }
     }
-}
+
+    fn ensureConn(self: *Bridge) !void {
+        if (self.conn != null) return;
+        const t = self.cfg.target;
+        if (t.secure) {
+            const tls = try schannel.connect(self.alloc, t.host, t.port, @ptrCast(self.verifier.?), Verifier.verifyOpaque);
+            self.conn = .{ .tls = tls };
+        } else {
+            const ps = try plain.PlainStream.connect(self.alloc, t.host, t.port);
+            self.conn = .{ .plain = ps };
+        }
+        if (self.cfg.verbose) std.debug.print("mcp-bridge: connected\n", .{});
+    }
+
+    fn buildHeaders(self: *Bridge, headers: *std.ArrayList([]const u8), session_hdr: *?[]const u8) !void {
+        try headers.appendSlice(self.alloc, self.cfg.headers.items);
+        if (self.session_id) |sid| {
+            session_hdr.* = try std.fmt.allocPrint(self.alloc, "MCP-Session-Id: {s}", .{sid});
+            try headers.append(self.alloc, session_hdr.*.?);
+        }
+        try headers.append(self.alloc, "MCP-Protocol-Version: 2025-03-26");
+    }
+
+    /// POST one JSON-RPC message. Reuses the persistent connection; on
+    /// failure of a PRE-EXISTING (possibly idle-stale) connection, drops it
+    /// and retries exactly once on a fresh connection.
+    fn request(self: *Bridge, line: []const u8) !http.Response {
+        const t = self.cfg.target;
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const reused = self.conn != null;
+            try self.ensureConn();
+
+            var headers: std.ArrayList([]const u8) = .empty;
+            defer headers.deinit(self.alloc);
+            var session_hdr: ?[]const u8 = null;
+            defer if (session_hdr) |h| self.alloc.free(h);
+            try self.buildHeaders(&headers, &session_hdr);
+
+            const resp = switch (self.conn.?) {
+                inline else => |*s| http.post(self.alloc, s, t.host, t.path, line, headers.items),
+            } catch |err| {
+                self.closeConn();
+                if (reused and attempt == 0) {
+                    if (self.cfg.verbose) std.debug.print("mcp-bridge: stale connection ({s}), retrying once on fresh connection\n", .{@errorName(err)});
+                    continue;
+                }
+                return err;
+            };
+            if (resp.server_closed) self.closeConn();
+            return resp;
+        }
+        unreachable;
+    }
+
+    /// Best-effort session termination (DELETE) on clean shutdown.
+    fn terminateSession(self: *Bridge) void {
+        if (self.session_id == null) return;
+        const t = self.cfg.target;
+        self.closeConn();
+        self.ensureConn() catch return;
+        defer self.closeConn();
+
+        var headers: std.ArrayList([]const u8) = .empty;
+        defer headers.deinit(self.alloc);
+        var session_hdr: ?[]const u8 = null;
+        defer if (session_hdr) |h| self.alloc.free(h);
+        self.buildHeaders(&headers, &session_hdr) catch return;
+
+        switch (self.conn.?) {
+            inline else => |*s| http.delete(self.alloc, s, t.host, t.path, headers.items) catch {},
+        }
+        if (self.cfg.verbose) std.debug.print("mcp-bridge: session terminated via DELETE\n", .{});
+    }
+};
 
 pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
@@ -250,7 +327,12 @@ pub fn main() !void {
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(alloc);
 
-    var session_id: ?[]const u8 = null;
+    var bridge = Bridge{
+        .alloc = alloc,
+        .cfg = &cfg,
+        .verifier = if (verifier != null) &verifier.? else null,
+    };
+    defer bridge.deinit();
 
     while (true) {
         const maybe_line = readLineFromStdin(alloc, stdin_h, &carry) catch null;
@@ -260,7 +342,7 @@ pub fn main() !void {
 
         if (cfg.verbose) std.debug.print("mcp-bridge: >> {s}\n", .{line});
 
-        var resp = serveRequest(alloc, &cfg, if (verifier != null) &verifier.? else null, &session_id, line) catch |err| {
+        var resp = bridge.request(line) catch |err| {
             // Synthesize a JSON-RPC error so the client isn't left hanging.
             var ebuf: [512]u8 = undefined;
             const emsg = mcp.formatTransportError(&ebuf, mcp.getRequestId(line), @errorName(err));
@@ -273,8 +355,8 @@ pub fn main() !void {
         // Capture session id from initialize response
         if (resp.mcp_session_id) |sid| {
             const copy = try alloc.dupe(u8, sid);
-            if (session_id) |old| alloc.free(@constCast(old));
-            session_id = copy;
+            if (bridge.session_id) |old| alloc.free(@constCast(old));
+            bridge.session_id = copy;
             if (cfg.verbose) std.debug.print("mcp-bridge: session {s}\n", .{sid});
         }
 
@@ -287,8 +369,6 @@ pub fn main() !void {
         }
     }
 
-    // Clean session shutdown (DELETE) — best effort
-    if (session_id != null and cfg.verbose) {
-        std.debug.print("mcp-bridge: stdin closed, exiting\n", .{});
-    }
+    if (cfg.verbose) std.debug.print("mcp-bridge: stdin closed, exiting\n", .{});
+    bridge.terminateSession();
 }

@@ -16,7 +16,8 @@ pub const HttpError = error{
 pub const Response = struct {
     status: u16,
     body: []u8,
-    mcp_session_id: ?[]u8, // owned slice into headers copy
+    mcp_session_id: ?[]u8, // owned slice into backing
+    server_closed: bool, // server sent Connection: close
     _backing: []u8, // owns body + session id memory
 
     pub fn deinit(self: *Response, alloc: std.mem.Allocator) void {
@@ -43,7 +44,7 @@ pub fn post(
     for (extra_headers) |h| {
         appendFmt(alloc, &req, "{s}\r\n", .{h}) catch return HttpError.OutOfMemory;
     }
-    appendFmt(alloc, &req, "Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return HttpError.OutOfMemory;
+    appendFmt(alloc, &req, "Content-Length: {d}\r\n\r\n", .{body.len}) catch return HttpError.OutOfMemory;
     req.appendSlice(alloc, body) catch return HttpError.OutOfMemory;
 
     tls.writeAll(req.items) catch return HttpError.WriteFailed;
@@ -66,7 +67,7 @@ pub fn delete(
     for (extra_headers) |h| {
         appendFmt(alloc, &req, "{s}\r\n", .{h}) catch return HttpError.OutOfMemory;
     }
-    req.appendSlice(alloc, "Connection: close\r\n\r\n") catch return HttpError.OutOfMemory;
+    req.appendSlice(alloc, "\r\n") catch return HttpError.OutOfMemory;
 
     tls.writeAll(req.items) catch return HttpError.WriteFailed;
     var resp = try readResponse(alloc, tls);
@@ -105,26 +106,69 @@ fn readResponse(alloc: std.mem.Allocator, tls: anytype) HttpError!Response {
     const status = std.fmt.parseInt(u16, head[sp1 + 1 .. sp2], 10) catch return HttpError.MalformedResponse;
 
     // Headers of interest
-    const content_length = getHeaderNumeric(head, "content-length") orelse 0;
+    const content_length = getHeaderNumeric(head, "content-length");
     const session_id = getHeaderValue(head, "mcp-session-id");
+    const conn_hdr = getHeaderValue(head, "connection");
+    const server_closed = if (conn_hdr) |v| std.ascii.eqlIgnoreCase(v, "close") else false;
+    const chunked = if (getHeaderValue(head, "transfer-encoding")) |v|
+        std.ascii.indexOfIgnoreCase(v, "chunked") != null
+    else
+        false;
 
-    // Read body until content_length satisfied
-    var body_have = buf.items.len - (he + 4);
-    while (body_have < content_length) {
-        if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
-        const n = tls.read(&tmp) catch return HttpError.ReadFailed;
-        if (n == 0) break; // tolerate early close
-        buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
-        body_have = buf.items.len - (he + 4);
+    var body = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+    defer body.deinit(alloc);
+
+    if (chunked) {
+        // Chunked transfer-encoding: read chunks until terminal 0-chunk.
+        // Remaining buffered bytes after the headers are chunk data.
+        var pos: usize = he + 4;
+        while (true) {
+            // Need a chunk-size line
+            var line_end = std.mem.indexOfPos(u8, buf.items, pos, "\r\n");
+            while (line_end == null) {
+                if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
+                const n = tls.read(&tmp) catch return HttpError.ReadFailed;
+                if (n == 0) return HttpError.MalformedResponse;
+                buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
+                line_end = std.mem.indexOfPos(u8, buf.items, pos, "\r\n");
+            }
+            const size_str = std.mem.trim(u8, buf.items[pos..line_end.?], " ");
+            const semi = std.mem.indexOfScalar(u8, size_str, ';') orelse size_str.len;
+            const chunk_size = std.fmt.parseInt(usize, size_str[0..semi], 16) catch return HttpError.MalformedResponse;
+            pos = line_end.? + 2;
+            if (chunk_size == 0) break; // terminal chunk (trailers ignored)
+
+            // Read chunk data + trailing CRLF
+            while (buf.items.len - pos < chunk_size + 2) {
+                if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
+                const n = tls.read(&tmp) catch return HttpError.ReadFailed;
+                if (n == 0) return HttpError.MalformedResponse;
+                buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
+            }
+            body.appendSlice(alloc, buf.items[pos .. pos + chunk_size]) catch return HttpError.OutOfMemory;
+            pos += chunk_size + 2;
+        }
+    } else {
+        const want = content_length orelse 0;
+        var body_have = buf.items.len - (he + 4);
+        while (body_have < want) {
+            if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
+            const n = tls.read(&tmp) catch return HttpError.ReadFailed;
+            if (n == 0) break; // tolerate early close
+            buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
+            body_have = buf.items.len - (he + 4);
+        }
+        const body_raw = buf.items[he + 4 ..];
+        const body_len = @min(body_raw.len, want);
+        body.appendSlice(alloc, body_raw[0..body_len]) catch return HttpError.OutOfMemory;
     }
 
     // Move body (+ optional session id) into one owned allocation
-    const body_raw = buf.items[he + 4 ..];
-    const body_len = @min(body_raw.len, content_length);
+    const body_len = body.items.len;
     const sid_len: usize = if (session_id) |s| s.len else 0;
 
     const backing = alloc.alloc(u8, body_len + sid_len) catch return HttpError.OutOfMemory;
-    @memcpy(backing[0..body_len], body_raw[0..body_len]);
+    @memcpy(backing[0..body_len], body.items);
     var sid: ?[]u8 = null;
     if (session_id) |s| {
         @memcpy(backing[body_len..][0..sid_len], s);
@@ -132,7 +176,7 @@ fn readResponse(alloc: std.mem.Allocator, tls: anytype) HttpError!Response {
     }
     buf.deinit(alloc);
 
-    return .{ .status = status, .body = backing[0..body_len], .mcp_session_id = sid, ._backing = backing };
+    return .{ .status = status, .body = backing[0..body_len], .mcp_session_id = sid, .server_closed = server_closed, ._backing = backing };
 }
 
 fn getHeaderValue(head: []const u8, name: []const u8) ?[]const u8 {

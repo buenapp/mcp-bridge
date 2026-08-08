@@ -46,6 +46,19 @@ pub const ws2 = std.os.windows.ws2_32;
 pub const SOCKET = ws2.SOCKET;
 pub const INVALID_SOCKET = ws2.INVALID_SOCKET;
 
+pub const SOL_SOCKET: i32 = 0xffff;
+pub const SO_RCVTIMEO: i32 = 0x1006;
+pub const SO_SNDTIMEO: i32 = 0x1005;
+pub const WSAETIMEDOUT: i32 = 10060;
+
+/// Set blocking recv/send timeouts (milliseconds) on a socket.
+pub fn setTimeouts(sock: SOCKET, recv_ms: u32, send_ms: u32) void {
+    const r: i32 = @intCast(recv_ms);
+    const s: i32 = @intCast(send_ms);
+    _ = ws2.setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, std.mem.asBytes(&r), @sizeOf(i32));
+    _ = ws2.setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, std.mem.asBytes(&s), @sizeOf(i32));
+}
+
 // --------------------------------------------------------------- SChannel --
 
 pub const SEC_WCHAR = u16;

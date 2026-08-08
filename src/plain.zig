@@ -10,6 +10,7 @@ pub const PlainError = error{
     WsaStartup,
     ConnectFailed,
     SocketError,
+    Timeout,
 };
 
 pub const PlainStream = struct {
@@ -28,7 +29,10 @@ pub const PlainStream = struct {
             const s = ws2.socket(addr.any.family, ws2.SOCK.STREAM, 0);
             if (s == win.INVALID_SOCKET) continue;
             const rc = ws2.connect(s, &addr.any, @intCast(addr.getOsSockLen()));
-            if (rc == 0) return .{ .sock = s, .alloc = alloc };
+            if (rc == 0) {
+                win.setTimeouts(s, 30_000, 15_000);
+                return .{ .sock = s, .alloc = alloc };
+            }
             _ = ws2.closesocket(s);
         }
         return PlainError.ConnectFailed;
@@ -37,7 +41,10 @@ pub const PlainStream = struct {
     pub fn read(self: *PlainStream, out: []u8) PlainError!usize {
         const n = ws2.recv(self.sock, out.ptr, @intCast(out.len), 0);
         if (n == 0) return 0;
-        if (n == ws2.SOCKET_ERROR) return PlainError.SocketError;
+        if (n == ws2.SOCKET_ERROR) {
+            if (@intFromEnum(ws2.WSAGetLastError()) == win.WSAETIMEDOUT) return PlainError.Timeout;
+            return PlainError.SocketError;
+        }
         return @intCast(n);
     }
 
