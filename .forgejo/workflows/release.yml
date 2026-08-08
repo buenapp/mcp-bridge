@@ -140,6 +140,8 @@ jobs:
           SIGN_PFX_B64_5: ${{ secrets.SIGN_PFX_B64_5 }}
           SIGN_PFX_B64_6: ${{ secrets.SIGN_PFX_B64_6 }}
         run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          VERSION="${TAG#v}"
           PFXFILE=$(mktemp /tmp/mcp-bridge-sign.XXXXXX)
           trap 'rm -f "$PFXFILE"' EXIT
           printf '%s' "${SIGN_PFX_B64_1}${SIGN_PFX_B64_2}${SIGN_PFX_B64_3}${SIGN_PFX_B64_4}${SIGN_PFX_B64_5}${SIGN_PFX_B64_6}" | base64 -d > "$PFXFILE"
