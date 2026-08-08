@@ -42,19 +42,13 @@ jobs:
       - name: Sign mcp-bridge.exe
         env:
           SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
-          # base64 PFX split into chunks (large single secrets get mangled in transit)
-          SIGN_PFX_B64_1: ${{ secrets.SIGN_PFX_B64_1 }}
-          SIGN_PFX_B64_2: ${{ secrets.SIGN_PFX_B64_2 }}
-          SIGN_PFX_B64_3: ${{ secrets.SIGN_PFX_B64_3 }}
-          SIGN_PFX_B64_4: ${{ secrets.SIGN_PFX_B64_4 }}
-          SIGN_PFX_B64_5: ${{ secrets.SIGN_PFX_B64_5 }}
-          SIGN_PFX_B64_6: ${{ secrets.SIGN_PFX_B64_6 }}
+          SIGN_PFX_B64: ${{ secrets.SIGN_PFX_B64 }}
         run: |
           doas pkg install -y osslsigncode
 
           PFXFILE=$(mktemp /tmp/mcp-bridge-sign.XXXXXX)
           trap 'rm -f "$PFXFILE"' EXIT
-          printf '%s' "${SIGN_PFX_B64_1}${SIGN_PFX_B64_2}${SIGN_PFX_B64_3}${SIGN_PFX_B64_4}${SIGN_PFX_B64_5}${SIGN_PFX_B64_6}" | base64 -d > "$PFXFILE"
+          printf '%s' "$SIGN_PFX_B64" | base64 -d > "$PFXFILE"
           openssl pkcs12 -in "$PFXFILE" -nokeys -passin pass:"$SIGN_PFX_PASSWORD" -noout
 
           osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
@@ -133,18 +127,13 @@ jobs:
       - name: Sign installer
         env:
           SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
-          SIGN_PFX_B64_1: ${{ secrets.SIGN_PFX_B64_1 }}
-          SIGN_PFX_B64_2: ${{ secrets.SIGN_PFX_B64_2 }}
-          SIGN_PFX_B64_3: ${{ secrets.SIGN_PFX_B64_3 }}
-          SIGN_PFX_B64_4: ${{ secrets.SIGN_PFX_B64_4 }}
-          SIGN_PFX_B64_5: ${{ secrets.SIGN_PFX_B64_5 }}
-          SIGN_PFX_B64_6: ${{ secrets.SIGN_PFX_B64_6 }}
+          SIGN_PFX_B64: ${{ secrets.SIGN_PFX_B64 }}
         run: |
           TAG="${GITHUB_REF_NAME:-dev}"
           VERSION="${TAG#v}"
           PFXFILE=$(mktemp /tmp/mcp-bridge-sign.XXXXXX)
           trap 'rm -f "$PFXFILE"' EXIT
-          printf '%s' "${SIGN_PFX_B64_1}${SIGN_PFX_B64_2}${SIGN_PFX_B64_3}${SIGN_PFX_B64_4}${SIGN_PFX_B64_5}${SIGN_PFX_B64_6}" | base64 -d > "$PFXFILE"
+          printf '%s' "$SIGN_PFX_B64" | base64 -d > "$PFXFILE"
           osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
             -h sha256 -n "MCP Bridge Installer" \
             -i "https://pacyworld.dev/buenapp/mcp-bridge" \
