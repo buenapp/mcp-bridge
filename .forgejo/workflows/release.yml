@@ -45,7 +45,7 @@ jobs:
           SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
         run: |
           set -e
-          PFXFILE=$(mktemp)
+          PFXFILE=$(mktemp /tmp/mcp-bridge-sign.XXXXXX)
           trap 'rm -f "$PFXFILE"' EXIT
           echo "$SIGN_PFX_BASE64" | base64 -d > "$PFXFILE"
           osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
@@ -129,7 +129,7 @@ jobs:
           set -e
           TAG="${GITHUB_REF_NAME:-dev}"
           VERSION="${TAG#v}"
-          PFXFILE=$(mktemp)
+          PFXFILE=$(mktemp /tmp/mcp-bridge-sign.XXXXXX)
           trap 'rm -f "$PFXFILE"' EXIT
           echo "$SIGN_PFX_BASE64" | base64 -d > "$PFXFILE"
           osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
