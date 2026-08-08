@@ -30,9 +30,18 @@
     <rect x="94"  y="203" width="20" height="37" rx="10" fill="url(#gold)"/>
     <rect x="140" y="203" width="20" height="37" rx="10" fill="url(#gold)"/>
 
-    <!-- "Mcp" etched: inset shadow copy, then white letterforms on top -->
-    <g transform="translate(4,5)"
+    <!-- "Mcp" etched inlay: dark groove shadow above, light rim below,
+         white letters seated in the carve -->
+    <g transform="translate(4,-3)"
        fill="none" stroke="#4249C9" stroke-width="18"
+       stroke-linecap="round" stroke-linejoin="round">
+      <path d="M42,138 L42,64 L64,106 L86,64 L86,138"/>
+      <path d="M149.9,97.5 A21,21 0 1 0 149.9,133.5"/>
+      <path d="M178,166 L178,88"/>
+      <path d="M181,97.5 A21,21 0 1 1 181,130.5"/>
+    </g>
+    <g transform="translate(4,4.5)"
+       fill="none" stroke="#CDD1FF" stroke-width="19"
        stroke-linecap="round" stroke-linejoin="round">
       <path d="M42,138 L42,64 L64,106 L86,64 L86,138"/>
       <path d="M149.9,97.5 A21,21 0 1 0 149.9,133.5"/>
