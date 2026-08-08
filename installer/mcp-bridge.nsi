@@ -4,6 +4,9 @@
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "WinMessages.nsh"
+!include "StrFunc.nsh"
+${Using:StrFunc} StrStr
+${UnStrRep}
 
 ; --- Build-time defines (override with -D on makensis command line) ---
 !ifndef VERSION
@@ -89,95 +92,20 @@ Section "Uninstall"
   DeleteRegKey HKCU "Software\MCP Bridge"
 SectionEnd
 
-; --- StrStr: find needle in haystack ---
-; Usage: Push "<needle>" \n Push "<haystack>" \n Call StrStr \n Pop $out ("" if not found)
-Function StrStr
-  Exch $R0          ; haystack
-  Exch
-  Exch $R1          ; needle
-  Push $R2
-  Push $R3
-  Push $R4
-  StrLen $R2 $R1    ; needle length
-  StrLen $R3 $R0    ; haystack length
-  ${If} $R2 == 0
-    StrCpy $R0 ""
-    Goto done
-  ${EndIf}
-  loop:
-    IntCmp $R3 $R2 notfound             ; remaining < needle len -> not found
-                                        ; (equal must fall through to compare —
-                                        ;  jumping back to 'loop' spins forever)
-    StrCpy $R4 $R0 $R2                  ; first needle-len chars
-    ${If} $R4 == $R1
-      Goto done                         ; $R0 = haystack at match (non-empty)
-    ${EndIf}
-    StrCpy $R0 $R0 "" 1                 ; drop first char
-    IntOp $R3 $R3 - 1
-    Goto loop
-  notfound:
-    StrCpy $R0 ""
-  done:
-    Pop $R4
-    Pop $R3
-    Pop $R2
-    Pop $R1
-    Exch $R0
-FunctionEnd
-
-; --- un.StrRep: remove ALL occurrences of needle from haystack ---
-; Usage: Push "<needle>" \n Push "<haystack>" \n Call un.StrRep \n Pop $out
-Function un.StrRep
-  Exch $R0          ; haystack
-  Exch
-  Exch $R1          ; needle
-  Push $R2
-  Push $R3
-  Push $R4
-  Push $R5
-  StrCpy $R5 ""     ; result
-  StrLen $R2 $R1
-  StrLen $R3 $R0
-  ${If} $R2 == 0
-    StrCpy $R5 $R0
-    Goto done
-  ${EndIf}
-  loop:
-    IntCmp $R3 $R2 tail                 ; remaining < needle len -> append rest
-                                        ; (equal must fall through — it may be the needle)
-    StrCpy $R4 $R0 $R2
-    ${If} $R4 == $R1
-      StrCpy $R0 $R0 "" $R2             ; skip needle
-      IntOp $R3 $R3 - $R2
-      Goto loop
-    ${EndIf}
-    StrCpy $R4 $R0 1
-    StrCpy $R5 "$R5$R4"
-    StrCpy $R0 $R0 "" 1
-    IntOp $R3 $R3 - 1
-    Goto loop
-  tail:
-    StrCpy $R5 "$R5$R0"
-  done:
-    StrCpy $R0 $R5
-    Pop $R5
-    Pop $R4
-    Pop $R3
-    Pop $R2
-    Pop $R1
-    Exch $R0
-FunctionEnd
-
 ; --- Add $INSTDIR to the user PATH (HKCU\Environment) ---
 Function AddToUserPath
   ReadRegStr $0 HKCU "Environment" "Path"
+  ; Drop a trailing ';' so we don't produce a double separator
+  ${If} $0 != ""
+    StrCpy $1 $0 1 -1
+    ${If} $1 == ";"
+      StrCpy $0 $0 -1
+    ${EndIf}
+  ${EndIf}
   ${If} $0 == ""
     WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR"
   ${Else}
-    Push "$INSTDIR"
-    Push $0
-    Call StrStr
-    Pop $1
+    ${StrStr} $1 $0 "$INSTDIR"
     ${If} $1 == ""
       WriteRegExpandStr HKCU "Environment" "Path" "$0;$INSTDIR"
     ${EndIf}
@@ -194,28 +122,18 @@ Function un.RemoveFromUserPath
   ${If} $0 == ""
     Return
   ${EndIf}
-  ; Try ";$INSTDIR" (appended form)
-  Push ";$INSTDIR"
-  Push $0
-  Call un.StrRep
-  Pop $1
-  ${If} $1 != $0
-    WriteRegExpandStr HKCU "Environment" "Path" "$1"
-    Goto notify
+  ${UnStrRep} $1 $0 ";$INSTDIR" ""   ; appended form
+  ${If} $1 == $0
+    ${UnStrRep} $1 $0 "$INSTDIR;" "" ; first-entry form
   ${EndIf}
-  ; Try "$INSTDIR;" (was first entry)
-  Push "$INSTDIR;"
-  Push $0
-  Call un.StrRep
-  Pop $1
-  ${If} $1 != $0
-    WriteRegExpandStr HKCU "Environment" "Path" "$1"
-    Goto notify
+  ${If} $1 == $0
+    ${If} $0 == $INSTDIR              ; only entry
+      DeleteRegValue HKCU "Environment" "Path"
+      Goto notify
+    ${EndIf}
+    Return                            ; not present — nothing to do
   ${EndIf}
-  ; Only entry
-  ${If} $0 == $INSTDIR
-    DeleteRegValue HKCU "Environment" "Path"
-  ${EndIf}
+  WriteRegExpandStr HKCU "Environment" "Path" "$1"
   notify:
     System::Call 'user32::SendNotifyMessage(i 0xFFFF, i ${WM_SETTINGCHANGE}, i 0, t "Environment")'
 FunctionEnd
