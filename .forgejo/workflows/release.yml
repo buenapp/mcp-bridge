@@ -50,7 +50,7 @@ jobs:
           echo "$SIGN_PFX_BASE64" | base64 -d > "$PFXFILE"
           osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
             -h sha256 -n "MCP Bridge" \
-            -u "https://pacyworld.dev/buenapp/mcp-bridge" \
+            -i "https://pacyworld.dev/buenapp/mcp-bridge" \
             -t http://timestamp.digicert.com \
             -in zig-out/bin/mcp-bridge.exe -out mcp-bridge-signed.exe
           osslsigncode verify mcp-bridge-signed.exe
@@ -134,7 +134,7 @@ jobs:
           echo "$SIGN_PFX_BASE64" | base64 -d > "$PFXFILE"
           osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
             -h sha256 -n "MCP Bridge Installer" \
-            -u "https://pacyworld.dev/buenapp/mcp-bridge" \
+            -i "https://pacyworld.dev/buenapp/mcp-bridge" \
             -t http://timestamp.digicert.com \
             -in "mcp-bridge-${VERSION}-setup.exe" -out "mcp-bridge-${VERSION}-setup-signed.exe"
           osslsigncode verify "mcp-bridge-${VERSION}-setup-signed.exe"
