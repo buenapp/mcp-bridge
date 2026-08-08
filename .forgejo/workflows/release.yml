@@ -172,7 +172,7 @@ jobs:
 
           # Delete existing release for this tag if present
           RESP=$(curl -s -H "$AUTH" "$BASE_URL/releases/tags/$TAG")
-          EXISTING_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          EXISTING_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*' || true)
           if [ -n "$EXISTING_ID" ]; then
             curl -s -X DELETE -H "$AUTH" "$BASE_URL/releases/$EXISTING_ID"
             echo "Deleted existing release $EXISTING_ID"
