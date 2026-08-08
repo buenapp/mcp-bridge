@@ -400,8 +400,9 @@ pub const DNS_TLSA_DATA = extern struct {
     bSelector: BYTE,
     bMatchingType: BYTE,
     bCertificateAssociationDataLength: WORD,
-    wPadding: WORD = 0,
-    pbCertificateAssociationData: ?[*]u8,
+    bPad: [3]BYTE,
+    // Inline data follows (bCertificateAssociationDataLength bytes total).
+    bCertificateAssociationData: [1]BYTE,
 };
 
 pub const DNS_SOA_DATA = extern struct {

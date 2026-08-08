@@ -837,4 +837,4 @@
 3977 1293465 1786145872727937000 24abe4272ef067f9049588c8fb52305c 0 /home/admin/Documents/Projects/McpBridge/src/test_main.zig
 9264 1293463 1786145375377730000 7167134f7a50e338e6313856e7a5b53d 0 /home/admin/Documents/Projects/McpBridge/src/dane.zig
 1736 1292004 1786145704657458000 0fe0e3ba81ce4d4d3f1fa3e1ad5ac27f 0 /home/admin/Documents/Projects/McpBridge/src/mcp.zig
-13811 1292109 1786145532387789000 4d83573f4c0b05e64d9c8592bb7166b3 0 /home/admin/Documents/Projects/McpBridge/src/win.zig
+13882 1292109 1786148677632242000 90e70edb865dd3e62b0400fc16941a2b 0 /home/admin/Documents/Projects/McpBridge/src/win.zig

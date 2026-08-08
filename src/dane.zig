@@ -7,6 +7,22 @@
 const std = @import("std");
 const win = @import("win.zig");
 
+pub var verbose: bool = false;
+
+fn vprint(comptime fmt: []const u8, args: anytype) void {
+    if (verbose) std.debug.print(fmt, args);
+}
+
+fn hexEncode(alloc: std.mem.Allocator, data: []const u8) []u8 {
+    const out = alloc.alloc(u8, data.len * 2) catch return &.{};
+    const chars = "0123456789abcdef";
+    for (data, 0..) |b, i| {
+        out[i * 2] = chars[b >> 4];
+        out[i * 2 + 1] = chars[b & 0xf];
+    }
+    return out;
+}
+
 pub const TlsaRecord = struct {
     usage: u8, // 2 = DANE-TA, 3 = DANE-EE (0/1 = PKIX-* also matched like Bloom)
     selector: u8, // 0 = CERT, 1 = SPKI
@@ -44,22 +60,22 @@ pub fn matchCertToTlsa(
         else => return false,
     }
 
-    var processed_buf: [64]u8 = undefined;
-    const processed: []const u8 = switch (tlsa.matching_type) {
+    var hash_buf: [64]u8 = undefined;
+    const hashed: []const u8 = switch (tlsa.matching_type) {
         0 => selected,
         1 => blk: {
-            std.crypto.hash.sha2.Sha256.hash(selected, processed_buf[0..32], .{});
-            break :blk processed_buf[0..32];
+            std.crypto.hash.sha2.Sha256.hash(selected, hash_buf[0..32], .{});
+            break :blk hash_buf[0..32];
         },
         2 => blk: {
-            std.crypto.hash.sha2.Sha512.hash(selected, processed_buf[0..64], .{});
-            break :blk processed_buf[0..64];
+            std.crypto.hash.sha2.Sha512.hash(selected, hash_buf[0..64], .{});
+            break :blk hash_buf[0..64];
         },
         else => return false,
     };
 
-    if (processed.len != tlsa.data.len) return false;
-    return std.mem.eql(u8, processed, tlsa.data);
+    if (hashed.len != tlsa.data.len) return false;
+    return std.mem.eql(u8, hashed, tlsa.data);
 }
 
 /// Verify a cert chain (DER list, EE first) against TLSA records.
@@ -147,6 +163,8 @@ pub const ChainCert = struct {
 };
 
 /// Build the cert chain for the server leaf context via crypt32.
+/// The leaf's own hCertStore (where SChannel puts the other handshake
+/// certs) is passed as hAdditionalStore so intermediates are found.
 /// Caller must call freeChain().
 pub fn buildChain(leaf: *win.CERT_CONTEXT) !struct { chain: *win.CERT_CHAIN_CONTEXT, certs: []ChainCert } {
     var chain_ctx: ?*win.CERT_CHAIN_CONTEXT = null;
@@ -158,7 +176,7 @@ pub fn buildChain(leaf: *win.CERT_CONTEXT) !struct { chain: *win.CERT_CHAIN_CONT
         null,
         leaf,
         null,
-        null,
+        leaf.hCertStore, // SChannel keeps the peer's extra certs here
         &para,
         0,
         null,
@@ -169,10 +187,14 @@ pub fn buildChain(leaf: *win.CERT_CONTEXT) !struct { chain: *win.CERT_CHAIN_CONT
     errdefer win.CertFreeCertificateChain(chain_ctx.?);
 
     const chain = chain_ctx.?;
+    vprint("mcp-bridge: [dane] CertGetCertificateChain: cChain={d} trustError=0x{x}\n", .{
+        chain.cChain, chain.TrustStatus.dwErrorStatus,
+    });
     if (chain.cChain == 0 or chain.rgpChain == null) return error.EmptyChain;
 
     const simple = chain.rgpChain.?[0] orelse return error.EmptyChain;
     const n = simple.cElement;
+    vprint("mcp-bridge: [dane] simple chain cElement={d} trustError=0x{x}\n", .{ n, simple.TrustStatus.dwErrorStatus });
     const elems = simple.rgpElement orelse return error.EmptyChain;
 
     const certs = try std.heap.page_allocator.alloc(ChainCert, n);
@@ -206,13 +228,22 @@ pub fn verifyChainDane(
     for (tlsa_records) |tlsa| {
         if (tlsa.usage > 3 or tlsa.selector > 1 or tlsa.matching_type > 2) continue;
 
+        vprint("mcp-bridge: [dane] chain has {d} cert(s); tlsa usage={d} sel={d} mt={d} data={s}\n", .{
+            certs.len, tlsa.usage, tlsa.selector, tlsa.matching_type, hexEncode(alloc, tlsa.data),
+        });
+
         const tryMatch = struct {
             fn go(cc: []const ChainCert, t: TlsaRecord, idx: usize, a: std.mem.Allocator) bool {
                 if (t.selector == 1) {
-                    const spki = extractSpkiFromContext(a, cc[idx].ctx) catch return false;
+                    const spki = extractSpkiFromContext(a, cc[idx].ctx) catch |err| {
+                        vprint("mcp-bridge: [dane]   cert[{d}] SPKI extraction failed: {s}\n", .{ idx, @errorName(err) });
+                        return false;
+                    };
                     defer a.free(spki);
+                    vprint("mcp-bridge: [dane]   cert[{d}] spki({d}b) -> {s}\n", .{ idx, spki.len, hexEncode(a, processed(spki, t.matching_type)) });
                     return matchHashed(spki, t);
                 }
+                vprint("mcp-bridge: [dane]   cert[{d}] cert({d}b) -> {s}\n", .{ idx, cc[idx].der.len, hexEncode(a, processed(cc[idx].der, t.matching_type)) });
                 return matchHashed(cc[idx].der, t);
             }
         }.go;
@@ -236,21 +267,28 @@ pub fn verifyChainDane(
     return .validation_failed;
 }
 
-fn matchHashed(selected: []const u8, tlsa: TlsaRecord) bool {
-    var buf: [64]u8 = undefined;
-    const processed: []const u8 = switch (tlsa.matching_type) {
-        0 => selected,
-        1 => blk: {
-            std.crypto.hash.sha2.Sha256.hash(selected, buf[0..32], .{});
-            break :blk buf[0..32];
-        },
-        2 => blk: {
-            std.crypto.hash.sha2.Sha512.hash(selected, buf[0..64], .{});
-            break :blk buf[0..64];
-        },
-        else => return false,
+fn processed(selected: []const u8, matching_type: u8) []const u8 {
+    const S = struct {
+        var buf: [64]u8 = undefined;
     };
-    return std.mem.eql(u8, processed, tlsa.data);
+    switch (matching_type) {
+        0 => return selected,
+        1 => {
+            std.crypto.hash.sha2.Sha256.hash(selected, S.buf[0..32], .{});
+            return S.buf[0..32];
+        },
+        2 => {
+            std.crypto.hash.sha2.Sha512.hash(selected, S.buf[0..64], .{});
+            return S.buf[0..64];
+        },
+        else => return &.{},
+    }
+}
+
+fn matchHashed(selected: []const u8, tlsa: TlsaRecord) bool {
+    const p = processed(selected, tlsa.matching_type);
+    if (p.len != tlsa.data.len) return false;
+    return std.mem.eql(u8, p, tlsa.data);
 }
 
 /// PKI fallback: standard server-auth chain policy against the Windows

@@ -220,6 +220,8 @@ pub fn main() !void {
     }
     cfg.target = parseUrl(url orelse usage()) catch usage();
     schannel.verbose = cfg.verbose;
+    dns.verbose = cfg.verbose;
+    dane.verbose = cfg.verbose;
 
     if (cfg.verbose) {
         std.debug.print("mcp-bridge: {s}://{s}:{d}{s}\n", .{
