@@ -1,0 +1,220 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  LINUX_JAIL: linux-build-${{ github.run_id }}
+  JAIL_ROOT: /usr/local/jails
+
+jobs:
+  build-and-release:
+    runs-on: FreeBSD
+    steps:
+      - name: Checkout
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          rm -rf ./* ./.??*
+          curl -sLo repo.tar.gz "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/$GITHUB_REF_NAME.tar.gz"
+          tar xf repo.tar.gz --strip-components=1
+          rm repo.tar.gz
+
+      # --- Cross-compile with zig (directly on host) ---
+      - name: Install zig
+        run: |
+          which zig && zig version || doas pkg install -y zig
+
+      - name: Unit tests (host)
+        run: zig build test
+
+      - name: Build mcp-bridge.exe (ReleaseSafe)
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          file zig-out/bin/mcp-bridge.exe
+          ls -l zig-out/bin/mcp-bridge.exe
+
+      # --- Authenticode signing (osslsigncode, FreeBSD native) ---
+      - name: Install osslsigncode
+        run: |
+          which osslsigncode || doas pkg install -y osslsigncode
+
+      - name: Sign mcp-bridge.exe
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          set -e
+          PFXFILE=$(mktemp)
+          trap 'rm -f "$PFXFILE"' EXIT
+          echo "$SIGN_PFX_BASE64" | base64 -d > "$PFXFILE"
+          osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
+            -h sha256 -n "MCP Bridge" \
+            -u "https://pacyworld.dev/buenapp/mcp-bridge" \
+            -t http://timestamp.digicert.com \
+            -in zig-out/bin/mcp-bridge.exe -out mcp-bridge-signed.exe
+          osslsigncode verify mcp-bridge-signed.exe
+          mv mcp-bridge-signed.exe zig-out/bin/mcp-bridge.exe
+
+      # --- Linux jail: build NSIS installer (no FreeBSD nsis package) ---
+      - name: Provision Linux jail
+        run: |
+          JAIL="$LINUX_JAIL"
+          JPATH="$JAIL_ROOT/$JAIL"
+          TMPBASE="/tmp/linux-rootfs-ubuntu-24.04.4.tar.gz"
+
+          doas kldload linux64 2>/dev/null || true
+          doas kldload linux_common 2>/dev/null || true
+
+          if [ ! -f "$TMPBASE" ]; then
+            echo "==> Fetching Ubuntu 24.04 rootfs..."
+            curl -fSL -o "$TMPBASE" "https://cdimage.ubuntu.com/ubuntu-base/releases/noble/release/ubuntu-base-24.04.4-base-amd64.tar.gz"
+          fi
+
+          doas mkdir -p "$JPATH"
+          doas tar -xf "$TMPBASE" -C "$JPATH"
+          doas cp /etc/resolv.conf "$JPATH/etc/resolv.conf"
+
+          doas mkdir -p "$JPATH/proc" "$JPATH/sys" "$JPATH/dev/shm"
+          doas mount -t linprocfs linprocfs "$JPATH/proc"
+          doas mount -t linsysfs linsysfs "$JPATH/sys"
+          doas mount -t devfs devfs "$JPATH/dev"
+          doas mount -t tmpfs tmpfs "$JPATH/dev/shm"
+
+          doas jail -c name="$JAIL" path="$JPATH" ip4=inherit ip6=inherit \
+            host.hostname="$JAIL" allow.raw_sockets=1 linux=new persist
+
+          doas jexec "$JAIL" sh -c 'echo "APT::Cache-Start \"100000000\";" > /etc/apt/apt.conf.d/99cache'
+          doas jexec "$JAIL" apt-get update -qq
+          doas jexec "$JAIL" apt-get install -y -qq nsis
+
+      - name: Build NSIS installer
+        run: |
+          JPATH="$JAIL_ROOT/$LINUX_JAIL"
+          TAG="${GITHUB_REF_NAME:-dev}"
+          VERSION="${TAG#v}"
+
+          doas mkdir -p "$JPATH/tmp/build"
+          doas cp zig-out/bin/mcp-bridge.exe "$JPATH/tmp/build/"
+          doas cp assets/mcp-bridge.ico "$JPATH/tmp/build/"
+          doas cp installer/mcp-bridge.nsi "$JPATH/tmp/build/"
+          doas cp README.md "$JPATH/tmp/build/"
+
+          doas jexec "$LINUX_JAIL" sh -c \
+            "cd /tmp/build && makensis -DVERSION=${VERSION} -DOUTFILE=mcp-bridge-${VERSION}-setup.exe mcp-bridge.nsi"
+
+          cp "$JPATH/tmp/build/mcp-bridge-${VERSION}-setup.exe" .
+          file "mcp-bridge-${VERSION}-setup.exe"
+          ls -l "mcp-bridge-${VERSION}-setup.exe"
+
+      - name: Tear down Linux jail
+        if: always()
+        run: |
+          JPATH="$JAIL_ROOT/$LINUX_JAIL"
+          doas jail -r "$LINUX_JAIL" 2>/dev/null || true
+          doas umount "$JPATH/dev/shm" 2>/dev/null || true
+          doas umount "$JPATH/dev" 2>/dev/null || true
+          doas umount "$JPATH/sys" 2>/dev/null || true
+          doas umount "$JPATH/proc" 2>/dev/null || true
+          if [ -d "$JPATH" ]; then
+            doas chflags -R noschg "$JPATH" 2>/dev/null || true
+            doas rm -rf "$JPATH"
+          fi
+
+      - name: Sign installer
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME:-dev}"
+          VERSION="${TAG#v}"
+          PFXFILE=$(mktemp)
+          trap 'rm -f "$PFXFILE"' EXIT
+          echo "$SIGN_PFX_BASE64" | base64 -d > "$PFXFILE"
+          osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
+            -h sha256 -n "MCP Bridge Installer" \
+            -u "https://pacyworld.dev/buenapp/mcp-bridge" \
+            -t http://timestamp.digicert.com \
+            -in "mcp-bridge-${VERSION}-setup.exe" -out "mcp-bridge-${VERSION}-setup-signed.exe"
+          osslsigncode verify "mcp-bridge-${VERSION}-setup-signed.exe"
+          mv "mcp-bridge-${VERSION}-setup-signed.exe" "mcp-bridge-${VERSION}-setup.exe"
+
+      # --- Publish Forgejo release (only on tag push) ---
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          REPO="$GITHUB_REPOSITORY"
+          BASE_URL="$GITHUB_SERVER_URL/api/v1/repos/$REPO"
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${TAG#v}"
+          AUTH="Authorization: token $FORGEJO_TOKEN"
+
+          # Detect pre-release (rc, alpha, beta suffixes)
+          PRERELEASE=false
+          case "$VERSION" in *-rc*|*-alpha*|*-beta*) PRERELEASE=true ;; esac
+
+          # Delete existing release for this tag if present
+          RESP=$(curl -s -H "$AUTH" "$BASE_URL/releases/tags/$TAG")
+          EXISTING_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          if [ -n "$EXISTING_ID" ]; then
+            curl -s -X DELETE -H "$AUTH" "$BASE_URL/releases/$EXISTING_ID"
+            echo "Deleted existing release $EXISTING_ID"
+          fi
+
+          # Create release
+          RESP=$(curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"## MCP Bridge $TAG\\n\\nCommit: $GITHUB_SHA\\n\\n### Downloads\\n- **mcp-bridge-${VERSION}-setup.exe** — Windows installer (per-user, no admin)\\n- **mcp-bridge-${VERSION}.exe** — standalone binary\\n\\nBoth are Authenticode-signed.\",\"draft\":false,\"prerelease\":$PRERELEASE}" \
+            "$BASE_URL/releases")
+          echo "Create release response: $RESP"
+          RELEASE_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          if [ -z "$RELEASE_ID" ]; then
+            echo "ERROR: Failed to create release"
+            exit 1
+          fi
+          echo "Created release $RELEASE_ID"
+
+          # Upload installer
+          curl -s -X POST -H "$AUTH" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@mcp-bridge-${VERSION}-setup.exe" \
+            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-setup.exe"
+          echo "Uploaded installer"
+
+          # Upload standalone binary
+          curl -s -X POST -H "$AUTH" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @zig-out/bin/mcp-bridge.exe \
+            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}.exe"
+          echo "Uploaded standalone binary"
+
+      # --- Publish to WebDAV (download.morante.com) ---
+      - name: Upload to download.morante.com
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
+        run: |
+          set -e
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${TAG#v}"
+          BASE="https://download.morante.com/uploads"
+
+          curl -sf -u "$WEBDAV_USER:$WEBDAV_PASS" \
+            -T "mcp-bridge-${VERSION}-setup.exe" \
+            "$BASE/mcp-bridge-${VERSION}-setup.exe"
+          echo "Uploaded installer to WebDAV"
+
+          curl -sf -u "$WEBDAV_USER:$WEBDAV_PASS" \
+            -T zig-out/bin/mcp-bridge.exe \
+            "$BASE/mcp-bridge-${VERSION}.exe"
+          echo "Uploaded standalone to WebDAV"
+
+          # Stable "latest" URL
+          curl -sf -u "$WEBDAV_USER:$WEBDAV_PASS" \
+            -T zig-out/bin/mcp-bridge.exe \
+            "$BASE/mcp-bridge-latest.exe"
+          echo "Uploaded mcp-bridge-latest.exe"

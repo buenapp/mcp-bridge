@@ -20,6 +20,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Icon + version info (Windows resource script, compiled by zig's rc)
+    if (target.result.os.tag == .windows) {
+        exe.addWin32ResourceFile(.{ .file = b.path("assets/mcp-bridge.rc") });
+    }
+
     exe.root_module.linkSystemLibrary("ws2_32", .{});
     exe.root_module.linkSystemLibrary("secur32", .{});
     exe.root_module.linkSystemLibrary("crypt32", .{});

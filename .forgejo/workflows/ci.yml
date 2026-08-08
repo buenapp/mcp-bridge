@@ -1,0 +1,29 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: FreeBSD
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install zig
+        run: |
+          which zig && zig version || doas pkg install -y zig
+
+      - name: Unit tests (host)
+        run: zig build test
+
+      - name: Build (ReleaseSafe, x86_64-windows)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Verify binary
+        run: |
+          file zig-out/bin/mcp-bridge.exe
+          ls -la zig-out/bin/mcp-bridge.exe
+          objdump -h zig-out/bin/mcp-bridge.exe | grep -i rsrc
