@@ -167,7 +167,7 @@ FunctionEnd
 
 ; --- Add $INSTDIR to the user PATH (HKCU\Environment) ---
 Function AddToUserPath
-  ReadRegExpandStr $0 HKCU "Environment" "Path"
+  ReadRegStr $0 HKCU "Environment" "Path"
   ${If} $0 == ""
     WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR"
   ${Else}
@@ -185,7 +185,7 @@ FunctionEnd
 
 ; --- Remove $INSTDIR from the user PATH ---
 Function un.RemoveFromUserPath
-  ReadRegExpandStr $0 HKCU "Environment" "Path"
+  ReadRegStr $0 HKCU "Environment" "Path"
   ${If} $0 == ""
     Return
   ${EndIf}
