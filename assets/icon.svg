@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="face" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#767CF7"/>
+      <stop offset="1" stop-color="#565BE6"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#F9DC8A"/>
+      <stop offset="0.55" stop-color="#E9B63C"/>
+      <stop offset="1" stop-color="#C98F1F"/>
+    </linearGradient>
+  </defs>
+
+  <!-- No tilt; dimension comes from the extruded bottom edge -->
+  <g transform="translate(0,2)">
+
+    <!-- Depth: darker bottom edge of the tile (slab thickness) -->
+    <rect x="20" y="36" width="216" height="184" rx="42" fill="#4338CA"/>
+
+    <!-- Front face -->
+    <rect x="20" y="12" width="216" height="184" rx="42" fill="url(#face)"/>
+
+    <!-- Socket holes punched into the slab's bottom edge -->
+    <rect x="91"  y="199" width="26" height="16" rx="8" fill="#2E2A8E"/>
+    <rect x="137" y="199" width="26" height="16" rx="8" fill="#2E2A8E"/>
+
+    <!-- Socket / plug connectors (gold, cylindrical shading) — drawn LAST so
+         their tops sit inside the holes: they emerge from the slab itself -->
+    <rect x="94"  y="203" width="20" height="37" rx="10" fill="url(#gold)"/>
+    <rect x="140" y="203" width="20" height="37" rx="10" fill="url(#gold)"/>
+
+    <!-- "Mcp" etched: inset shadow copy, then white letterforms on top -->
+    <g transform="translate(4,5)"
+       fill="none" stroke="#4249C9" stroke-width="18"
+       stroke-linecap="round" stroke-linejoin="round">
+      <path d="M42,138 L42,64 L64,106 L86,64 L86,138"/>
+      <path d="M149.9,97.5 A21,21 0 1 0 149.9,133.5"/>
+      <path d="M178,166 L178,88"/>
+      <path d="M181,97.5 A21,21 0 1 1 181,130.5"/>
+    </g>
+    <g transform="translate(4,0)"
+       fill="none" stroke="#FFFFFF" stroke-width="18"
+       stroke-linecap="round" stroke-linejoin="round">
+      <!-- M -->
+      <path d="M42,138 L42,64 L64,106 L86,64 L86,138"/>
+      <!-- c -->
+      <path d="M149.9,97.5 A21,21 0 1 0 149.9,133.5"/>
+      <!-- p (stem + bowl) -->
+      <path d="M178,166 L178,88"/>
+      <path d="M181,97.5 A21,21 0 1 1 181,130.5"/>
+    </g>
+  </g>
+</svg>
