@@ -26,4 +26,4 @@ jobs:
         run: |
           file zig-out/bin/mcp-bridge.exe
           ls -la zig-out/bin/mcp-bridge.exe
-          objdump -h zig-out/bin/mcp-bridge.exe | grep -i rsrc
+          readelf -S zig-out/bin/mcp-bridge.exe | grep -i rsrc
