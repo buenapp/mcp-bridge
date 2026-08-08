@@ -1,5 +1,7 @@
 # McpBridge
 
+<img src="assets/icon.svg" align="right" width="128" alt="MCP Bridge icon">
+
 MCP stdio bridge for Windows: connects MCP clients that only speak stdio
 (IDEs like Windsurf/Devin) to remote MCP servers over HTTP(S) **Streamable
 HTTP** transport — without Node.js.
@@ -21,9 +23,9 @@ Example `mcp_config.json` entry:
 ```json
 {
   "mcpServers": {
-    "memory": {
+    "example": {
       "command": "C:\\tools\\mcp-bridge.exe",
-      "args": ["https://memory.morante.com/mcp"]
+      "args": ["https://mcp.example.com/mcp"]
     }
   }
 }
@@ -39,9 +41,9 @@ This bridge targets stdio-only clients like Claude Desktop
 ```json
 {
   "mcpServers": {
-    "memory": {
+    "example": {
       "command": "C:\\tools\\mcp-bridge.exe",
-      "args": ["https://memory.morante.com/mcp"]
+      "args": ["https://mcp.example.com/mcp"]
     }
   }
 }

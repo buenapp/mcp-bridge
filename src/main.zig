@@ -10,7 +10,7 @@
 //
 // Example (mcp_config.json):
 //   "memory": { "command": "C:\\tools\\mcp-bridge.exe",
-//               "args": ["https://memory.morante.com/mcp"] }
+//               "args": ["https://mcp.example.com/mcp"] }
 
 const std = @import("std");
 const win = @import("win.zig");
