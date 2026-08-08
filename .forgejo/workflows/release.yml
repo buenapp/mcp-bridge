@@ -49,7 +49,6 @@ jobs:
           PFXFILE=$(mktemp /tmp/mcp-bridge-sign.XXXXXX)
           trap 'rm -f "$PFXFILE"' EXIT
           printf '%s' "$SIGN_PFX_B64" | base64 -d > "$PFXFILE"
-          openssl pkcs12 -in "$PFXFILE" -nokeys -passin pass:"$SIGN_PFX_PASSWORD" -noout
 
           osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
             -h sha256 -n "MCP Bridge" \
