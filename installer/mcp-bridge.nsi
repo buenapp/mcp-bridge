@@ -105,7 +105,9 @@ Function StrStr
     Goto done
   ${EndIf}
   loop:
-    IntCmp $R3 $R2 notfound loop loop   ; remaining < needle len -> not found
+    IntCmp $R3 $R2 notfound             ; remaining < needle len -> not found
+                                        ; (equal must fall through to compare —
+                                        ;  jumping back to 'loop' spins forever)
     StrCpy $R4 $R0 $R2                  ; first needle-len chars
     ${If} $R4 == $R1
       Goto done                         ; $R0 = haystack at match (non-empty)
@@ -141,7 +143,8 @@ Function un.StrRep
     Goto done
   ${EndIf}
   loop:
-    IntCmp $R3 $R2 tail tail            ; remaining < needle len -> append rest
+    IntCmp $R3 $R2 tail                 ; remaining < needle len -> append rest
+                                        ; (equal must fall through — it may be the needle)
     StrCpy $R4 $R0 $R2
     ${If} $R4 == $R1
       StrCpy $R0 $R0 "" $R2             ; skip needle
