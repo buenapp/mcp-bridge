@@ -1,15 +1,19 @@
 // Minimal HTTP/1.1 client over a TlsStream (request/response only).
-// MCP Streamable HTTP (2025-03-26) with Accept: application/json returns
-// plain JSON bodies — no SSE parsing needed.
+// Sends Accept: application/json, text/event-stream per MCP spec; handles
+// plain JSON responses AND SSE-framed responses (some servers, e.g. the
+// Jenkins MCP plugin / Java SDK, require SSE). Chunked transfer-encoding
+// supported. For SSE responses the connection is left mid-stream — caller
+// must not reuse it.
 
 const std = @import("std");
-const schannel = @import("schannel.zig");
+const mcp = @import("mcp.zig");
 
 pub const HttpError = error{
     WriteFailed,
     ReadFailed,
     MalformedResponse,
     ResponseTooLarge,
+    SseEndedWithoutResponse,
     OutOfMemory,
 };
 
@@ -25,8 +29,17 @@ pub const Response = struct {
     }
 };
 
+pub const SseSink = struct {
+    ctx: ?*anyopaque = null,
+    /// Called with each non-matching SSE message payload (server-pushed
+    /// notifications etc.). May be null to drop them.
+    push: ?*const fn (ctx: ?*anyopaque, data: []const u8) void = null,
+};
+
 /// POST `body` to `path` on an established TLS stream.
 /// Extra headers (e.g. auth) are raw "Name: Value" strings.
+/// `expect_id`: raw JSON id of the request (for SSE response matching;
+/// null = notification, first SSE message event wins).
 /// Returns owned Response (call deinit).
 pub fn post(
     alloc: std.mem.Allocator,
@@ -35,12 +48,14 @@ pub fn post(
     path: []const u8,
     body: []const u8,
     extra_headers: []const []const u8,
+    expect_id: ?[]const u8,
+    sse_sink: SseSink,
 ) HttpError!Response {
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(alloc);
 
     appendFmt(alloc, &req, "POST {s} HTTP/1.1\r\nHost: {s}\r\n", .{ path, host }) catch return HttpError.OutOfMemory;
-    req.appendSlice(alloc, "Content-Type: application/json\r\nAccept: application/json\r\n") catch return HttpError.OutOfMemory;
+    req.appendSlice(alloc, "Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n") catch return HttpError.OutOfMemory;
     for (extra_headers) |h| {
         appendFmt(alloc, &req, "{s}\r\n", .{h}) catch return HttpError.OutOfMemory;
     }
@@ -49,7 +64,7 @@ pub fn post(
 
     tls.writeAll(req.items) catch return HttpError.WriteFailed;
 
-    return readResponse(alloc, tls);
+    return readResponse(alloc, tls, expect_id, sse_sink);
 }
 
 /// DELETE for session termination.
@@ -70,7 +85,7 @@ pub fn delete(
     req.appendSlice(alloc, "\r\n") catch return HttpError.OutOfMemory;
 
     tls.writeAll(req.items) catch return HttpError.WriteFailed;
-    var resp = try readResponse(alloc, tls);
+    var resp = try readResponse(alloc, tls, null, .{});
     resp.deinit(alloc);
 }
 
@@ -82,7 +97,118 @@ fn appendFmt(alloc: std.mem.Allocator, list: *std.ArrayList(u8), comptime fmt: [
     try list.appendSlice(alloc, s);
 }
 
-fn readResponse(alloc: std.mem.Allocator, tls: anytype) HttpError!Response {
+// Body framing mode determined from response headers.
+const BodyMode = union(enum) {
+    length: usize, // Content-Length
+    chunked, // Transfer-Encoding: chunked
+    until_close, // neither: read till EOF
+};
+
+/// Incremental de-chunking pump: decodes raw bytes from `buf` (cursor rpos)
+/// into `body_buf`. Returns .data when body bytes were appended (or more may
+/// follow), .end when the body is complete / stream closed.
+const Pump = struct {
+    mode: BodyMode,
+    rpos: usize,
+    chunk_left: usize = 0,
+
+    fn next(self: *Pump, alloc: std.mem.Allocator, tls: anytype, buf: *std.ArrayList(u8), body_buf: *std.ArrayList(u8)) HttpError!enum { data, end } {
+        var tmp: [16384]u8 = undefined;
+        switch (self.mode) {
+            .length => |*remaining| {
+                if (remaining.* == 0) return .end;
+                if (self.rpos >= buf.items.len) {
+                    if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
+                    const n = tls.read(&tmp) catch return HttpError.ReadFailed;
+                    if (n == 0) return .end; // tolerate early close
+                    buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
+                }
+                const avail = buf.items.len - self.rpos;
+                const n = @min(avail, remaining.*);
+                body_buf.appendSlice(alloc, buf.items[self.rpos .. self.rpos + n]) catch return HttpError.OutOfMemory;
+                self.rpos += n;
+                remaining.* -= n;
+                return .data;
+            },
+            .until_close => {
+                const n = tls.read(&tmp) catch return HttpError.ReadFailed;
+                if (n == 0) return .end;
+                if (body_buf.items.len + n > MAX_RESPONSE) return HttpError.ResponseTooLarge;
+                body_buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
+                return .data;
+            },
+            .chunked => {
+                if (self.chunk_left == 0) {
+                    // Need a chunk-size line
+                    var line_end = std.mem.indexOfPos(u8, buf.items, self.rpos, "\r\n");
+                    while (line_end == null) {
+                        if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
+                        const n = tls.read(&tmp) catch return HttpError.ReadFailed;
+                        if (n == 0) return HttpError.MalformedResponse;
+                        buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
+                        line_end = std.mem.indexOfPos(u8, buf.items, self.rpos, "\r\n");
+                    }
+                    const size_str = std.mem.trim(u8, buf.items[self.rpos..line_end.?], " ");
+                    const semi = std.mem.indexOfScalar(u8, size_str, ';') orelse size_str.len;
+                    const chunk_size = std.fmt.parseInt(usize, size_str[0..semi], 16) catch return HttpError.MalformedResponse;
+                    self.rpos = line_end.? + 2;
+                    if (chunk_size == 0) return .end; // trailers ignored
+                    self.chunk_left = chunk_size;
+                }
+                // Need chunk_left bytes + trailing CRLF
+                while (buf.items.len - self.rpos < self.chunk_left + 2) {
+                    if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
+                    const n = tls.read(&tmp) catch return HttpError.ReadFailed;
+                    if (n == 0) return HttpError.MalformedResponse;
+                    buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
+                }
+                body_buf.appendSlice(alloc, buf.items[self.rpos .. self.rpos + self.chunk_left]) catch return HttpError.OutOfMemory;
+                self.rpos += self.chunk_left + 2;
+                self.chunk_left = 0;
+                return .data;
+            },
+        }
+    }
+};
+
+/// Find the end of the next complete SSE event (blank-line separator).
+/// Returns the slice length INCLUDING the separator, or null if incomplete.
+fn sseEventEnd(data: []const u8) ?usize {
+    if (std.mem.indexOf(u8, data, "\r\n\r\n")) |i| return i + 4;
+    if (std.mem.indexOf(u8, data, "\n\n")) |i| return i + 2;
+    return null;
+}
+
+/// Extract the joined data: payload of an SSE event. Caller frees.
+fn sseEventData(alloc: std.mem.Allocator, event: []const u8) ?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var any = false;
+    var it = std.mem.splitScalar(u8, event, '\n');
+    while (it.next()) |line_raw| {
+        var line = line_raw;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0 or line[0] == ':') continue; // blank / comment
+        if (std.mem.startsWith(u8, line, "data:")) {
+            var payload = line["data:".len..];
+            if (payload.len > 0 and payload[0] == ' ') payload = payload[1..];
+            if (any) out.append(alloc, '\n') catch return null;
+            out.appendSlice(alloc, payload) catch return null;
+            any = true;
+        }
+    }
+    if (!any) {
+        out.deinit(alloc);
+        return null;
+    }
+    return out.toOwnedSlice(alloc) catch null;
+}
+
+fn readResponse(
+    alloc: std.mem.Allocator,
+    tls: anytype,
+    expect_id: ?[]const u8,
+    sse_sink: SseSink,
+) HttpError!Response {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
 
@@ -114,53 +240,62 @@ fn readResponse(alloc: std.mem.Allocator, tls: anytype) HttpError!Response {
         std.ascii.indexOfIgnoreCase(v, "chunked") != null
     else
         false;
+    const is_sse = if (getHeaderValue(head, "content-type")) |v|
+        std.ascii.indexOfIgnoreCase(v, "text/event-stream") != null
+    else
+        false;
 
-    var body = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+    const mode: BodyMode = if (chunked)
+        .chunked
+    else if (content_length) |cl|
+        .{ .length = cl }
+    else
+        .until_close;
+
+    var pump = Pump{ .mode = mode, .rpos = he + 4 };
+    var body: std.ArrayList(u8) = .empty;
     defer body.deinit(alloc);
 
-    if (chunked) {
-        // Chunked transfer-encoding: read chunks until terminal 0-chunk.
-        // Remaining buffered bytes after the headers are chunk data.
-        var pos: usize = he + 4;
+    if (!is_sse) {
         while (true) {
-            // Need a chunk-size line
-            var line_end = std.mem.indexOfPos(u8, buf.items, pos, "\r\n");
-            while (line_end == null) {
-                if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
-                const n = tls.read(&tmp) catch return HttpError.ReadFailed;
-                if (n == 0) return HttpError.MalformedResponse;
-                buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
-                line_end = std.mem.indexOfPos(u8, buf.items, pos, "\r\n");
+            switch (try pump.next(alloc, tls, &buf, &body)) {
+                .data => {},
+                .end => break,
             }
-            const size_str = std.mem.trim(u8, buf.items[pos..line_end.?], " ");
-            const semi = std.mem.indexOfScalar(u8, size_str, ';') orelse size_str.len;
-            const chunk_size = std.fmt.parseInt(usize, size_str[0..semi], 16) catch return HttpError.MalformedResponse;
-            pos = line_end.? + 2;
-            if (chunk_size == 0) break; // terminal chunk (trailers ignored)
-
-            // Read chunk data + trailing CRLF
-            while (buf.items.len - pos < chunk_size + 2) {
-                if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
-                const n = tls.read(&tmp) catch return HttpError.ReadFailed;
-                if (n == 0) return HttpError.MalformedResponse;
-                buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
-            }
-            body.appendSlice(alloc, buf.items[pos .. pos + chunk_size]) catch return HttpError.OutOfMemory;
-            pos += chunk_size + 2;
         }
     } else {
-        const want = content_length orelse 0;
-        var body_have = buf.items.len - (he + 4);
-        while (body_have < want) {
-            if (buf.items.len > MAX_RESPONSE) return HttpError.ResponseTooLarge;
-            const n = tls.read(&tmp) catch return HttpError.ReadFailed;
-            if (n == 0) break; // tolerate early close
-            buf.appendSlice(alloc, tmp[0..n]) catch return HttpError.OutOfMemory;
-            body_have = buf.items.len - (he + 4);
+        // SSE stream: dispatch complete events as they arrive. The event
+        // whose JSON-RPC id matches expect_id becomes the response body;
+        // other message events go to the sink (server-pushed messages).
+        var bpos: usize = 0;
+        var matched: ?[]u8 = null;
+        while (matched == null) {
+            while (sseEventEnd(body.items[bpos..])) |evlen| {
+                const event = body.items[bpos .. bpos + evlen];
+                bpos += evlen;
+                const payload = sseEventData(alloc, event) orelse continue;
+                const is_match = if (expect_id) |eid| blk: {
+                    const pid = mcp.getRequestId(payload) orelse break :blk false;
+                    break :blk std.mem.eql(u8, pid, eid);
+                } else true; // notification: first message event wins
+                if (is_match) {
+                    matched = payload;
+                    break;
+                }
+                if (sse_sink.push) |push| push(sse_sink.ctx, payload);
+                alloc.free(payload);
+            }
+            if (matched != null) break;
+            switch (try pump.next(alloc, tls, &buf, &body)) {
+                .data => {},
+                .end => return HttpError.SseEndedWithoutResponse,
+            }
         }
-        const body_raw = buf.items[he + 4 ..];
-        const body_len = @min(body_raw.len, want);
-        body.appendSlice(alloc, body_raw[0..body_len]) catch return HttpError.OutOfMemory;
+        // Compact body to just the matched payload
+        const m = matched.?;
+        body.clearRetainingCapacity();
+        body.appendSlice(alloc, m) catch return HttpError.OutOfMemory;
+        alloc.free(m);
     }
 
     // Move body (+ optional session id) into one owned allocation
@@ -176,7 +311,7 @@ fn readResponse(alloc: std.mem.Allocator, tls: anytype) HttpError!Response {
     }
     buf.deinit(alloc);
 
-    return .{ .status = status, .body = backing[0..body_len], .mcp_session_id = sid, .server_closed = server_closed, ._backing = backing };
+    return .{ .status = status, .body = backing[0..body_len], .mcp_session_id = sid, .server_closed = server_closed or is_sse, ._backing = backing };
 }
 
 fn getHeaderValue(head: []const u8, name: []const u8) ?[]const u8 {

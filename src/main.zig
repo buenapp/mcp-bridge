@@ -219,6 +219,14 @@ const Bridge = struct {
         try headers.append(self.alloc, "MCP-Protocol-Version: 2025-03-26");
     }
 
+    /// SSE sink: server-pushed (non-matching) message payloads go straight
+    /// to stdout so the client sees server-initiated notifications.
+    fn ssePush(ctx: ?*anyopaque, data: []const u8) void {
+        _ = ctx;
+        writeStdout(data) catch {};
+        writeStdout("\n") catch {};
+    }
+
     /// POST one JSON-RPC message. Reuses the persistent connection; on
     /// failure of a PRE-EXISTING (possibly idle-stale) connection, drops it
     /// and retries exactly once on a fresh connection.
@@ -236,7 +244,7 @@ const Bridge = struct {
             try self.buildHeaders(&headers, &session_hdr);
 
             const resp = switch (self.conn.?) {
-                inline else => |*s| http.post(self.alloc, s, t.host, t.path, line, headers.items),
+                inline else => |*s| http.post(self.alloc, s, t.host, t.path, line, headers.items, mcp.getRequestId(line), .{ .push = ssePush }),
             } catch |err| {
                 self.closeConn();
                 if (reused and attempt == 0) {
@@ -351,6 +359,19 @@ pub fn main() !void {
             continue;
         };
         defer resp.deinit(alloc);
+
+        // Error status without a JSON-RPC body (e.g. a bare 401 page):
+        // synthesize a proper JSON-RPC error instead of forwarding junk.
+        if (resp.status >= 400 and std.mem.indexOf(u8, resp.body, "\"jsonrpc\"") == null) {
+            var ebuf: [512]u8 = undefined;
+            var msg_buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "HTTP {d}", .{resp.status}) catch "HTTP error";
+            const emsg = mcp.formatTransportError(&ebuf, mcp.getRequestId(line), msg);
+            try writeStdout(emsg);
+            try writeStdout("\n");
+            if (cfg.verbose) std.debug.print("mcp-bridge: << {d} non-JSON-RPC body, synthesized error\n", .{resp.status});
+            continue;
+        }
 
         // Capture session id from initialize response
         if (resp.mcp_session_id) |sid| {

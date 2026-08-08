@@ -31,6 +31,24 @@ Example `mcp_config.json` entry:
 
 Auth headers can be passed with `--header "Authorization: Bearer <token>"`.
 
+### Claude Desktop / Claude Code
+
+This bridge targets stdio-only clients like Claude Desktop
+(`claude_desktop_config.json`) and Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "C:\\tools\\mcp-bridge.exe",
+      "args": ["https://memory.morante.com/mcp"]
+    }
+  }
+}
+```
+
+Diagnostics go to stderr (`--verbose`), stdout carries only JSON-RPC.
+
 ## Protocol behavior
 
 - stdin: newline-delimited JSON-RPC (one message per line)
