@@ -44,10 +44,16 @@ jobs:
           SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
           SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
         run: |
-          set -e
+          doas pkg install -y osslsigncode
+          osslsigncode --version | head -1
+
           PFXFILE=$(mktemp /tmp/mcp-bridge-sign.XXXXXX)
           trap 'rm -f "$PFXFILE"' EXIT
           echo "$SIGN_PFX_BASE64" | base64 -d > "$PFXFILE"
+          echo "PFX size: $(stat -f %z "$PFXFILE") bytes"
+          openssl pkcs12 -in "$PFXFILE" -nokeys -passin pass:"$SIGN_PFX_PASSWORD" -noout \
+            && echo "PFX parse OK" || echo "PFX parse FAILED"
+
           osslsigncode sign -pkcs12 "$PFXFILE" -pass "$SIGN_PFX_PASSWORD" \
             -h sha256 -n "MCP Bridge" \
             -i "https://pacyworld.dev/buenapp/mcp-bridge" \
