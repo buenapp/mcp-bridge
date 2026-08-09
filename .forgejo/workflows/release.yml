@@ -275,13 +275,53 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build-and-release
     steps:
-      # act containers (node:*-bookworm) lack ca-certificates — git over
-      # HTTPS fails without it, so this must precede actions/checkout.
+      # act containers (node:*-bookworm) lack ca-certificates, and
+      # pacyworld.dev is served from the private Pacy World Root CA —
+      # install both before git over HTTPS can work (must precede
+      # actions/checkout).
       - name: Bootstrap CA certificates
         run: |
           SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
           $SUDO apt-get update -qq
           $SUDO apt-get install -y -qq ca-certificates curl xz-utils
+          $SUDO tee /usr/local/share/ca-certificates/pacyworld-root.crt > /dev/null <<'EOF'
+          -----BEGIN CERTIFICATE-----
+          MIIGDDCCA/SgAwIBAgIJAPjlE9EKnbAtMA0GCSqGSIb3DQEBCwUAMIGSMQswCQYD
+          VQQGEwJVUzEQMA4GA1UECAwHRmxvcmlkYTEPMA0GA1UEBwwGTmFwbGVzMSkwJwYD
+          VQQKDCBUaGUgRGFuaWVsIE1vcmFudGUgQ29tcGFueSwgSW5jLjEYMBYGA1UECwwP
+          UGFjeSBXb3JsZCwgTExDMRswGQYDVQQDDBJQYWN5IFdvcmxkIFJvb3QgQ0EwHhcN
+          MTgwNzA3MTczNDAxWhcNMzgwNzAyMTczNDAxWjCBkjELMAkGA1UEBhMCVVMxEDAO
+          BgNVBAgMB0Zsb3JpZGExDzANBgNVBAcMBk5hcGxlczEpMCcGA1UECgwgVGhlIERh
+          bmllbCBNb3JhbnRlIENvbXBhbnksIEluYy4xGDAWBgNVBAsMD1BhY3kgV29ybGQs
+          IExMQzEbMBkGA1UEAwwSUGFjeSBXb3JsZCBSb290IENBMIICIjANBgkqhkiG9w0B
+          AQEFAAOCAg8AMIICCgKCAgEAxcG5VqHdWQ00Av5k8qQRtYit6ihHNCRBrOQqvrNV
+          V2pTaDgTc3HjgDhb3KtZpV/63EwTGkg2M+amm4XkCcwI2STiTLzKZ+wmuYf9/udQ
+          tjw5Br0p3T2c9HvZauNqzZ9L3e0HiI5+F4GI7rAjuRNU5oxD8MrfGXap6JgV8V8o
+          1bNkRI9xCYg2ZGCvJLWGBJK0fKxbl6N7A2Vh4FM4VzjMBxElUBYn4iazsyqsmfY0
+          eN1Ln6Yg64n34xYSPuJyEzhSbxLS0wMQO5N3d7UrYcK7REE/PR3lM8naqb/MWN6l
+          AeEB2cH138x1tPQywAk4BGWNaPndrCRnCFXkoianMgj2PztDKa5gk6l9WqSmwo8M
+          FlNhKknYWoaQ75Wz16goG3w1bkWDB/Wc5G+5GC2LD/WZNHAR6rA0tOK785pE/Lmb
+          aWhyqhndMTfRlaAlzEblzAoZX+sSB5ocs0AXf3e1EwV22E3UH+cghORp7z1CfbQI
+          vGF7fNG8c8tTzrgV9ifEphmZtDRrmtcbYYXJubdEKZmxahDN7QjVEnkXrdsuc8b7
+          Egz+KetGjj6n0tIRWCCxrIz9kOf652TBlJc/AWCnzDLgqv+CSw+Wrmm92dGfSgI4
+          W3todx0BW1XdMldbmB3Afo5o5gfc77QIcwSVSYJByiZDvkj9OPC48Hf1/1uGoe+r
+          4FsCAwEAAaNjMGEwHQYDVR0OBBYEFHoERjvfovVsJyua3AVoSD3edl25MB8GA1Ud
+          IwQYMBaAFHoERjvfovVsJyua3AVoSD3edl25MA8GA1UdEwEB/wQFMAMBAf8wDgYD
+          VR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBCwUAA4ICAQAe3IsTEblRYEGY/MICG8cg
+          l2SfqxYx0t9qvhCz/gLqvA8fiCijneAG3gR2trrHwTAQC5+arWUYs9yy8HilWTul
+          6HempVgguoz/XPqHsAonBW8vaImnSSVOsXIQkqkEX7g+HAAe4RMz71ykIXiWC345
+          LCjBVA3XGFNSIuQKchtzpchJGyVqqQxfbmeQt8rGvHkDkpCH3I8cO/J2xZW4n3bC
+          HUDj0oXuyW7zlKv4ytHK/TN+HYgMwXCd1LITK87OCmf4izLLdNxBwsQnWeaTNWS9
+          7wUGa0E9mWvuKONxx/JMVpUD+ewJQOD/JIYZumzNGBH3k0vl9pNtRAqeE03HmRCy
+          fgxWv8uJ/wz8mo3W8BRFnAd1AyJy6GPyLtMKa1yr11ITY0dJ/BTADmdO/6VKmlk5
+          sla/THr8mR4QYCUWE+zfU8nRGKLmJADg3lQJg0oC8HDTDyxZnAlM+0cFLanc5gDx
+          Q2/u+Z3fKyKGBaOzdruG5hKEWZ1E6bmNH2ttl/nkhiDl1tNFF4FWpC30N6PG1u1/
+          iJC/kgtEf2bSkfbm8xyrznWAygcinPSiH36C46M7y4GKp2+Aq6r95Q8b2YO69Opr
+          I/pDB/oQiCQ78Dp7e4yxY+GLR71QWf/wA5Tw1FbzqPvGnZ+tK//ZKGDeqmuDBCRF
+          3NDrfSHlK+Nk91FpLogS9g==
+          -----END CERTIFICATE-----
+          EOF
+          $SUDO update-ca-certificates
 
       - name: Checkout
         uses: actions/checkout@v4
