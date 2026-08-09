@@ -188,6 +188,33 @@ pub fn parseWwwAuthenticateResourceMetadata(header: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
+/// Extract the scope value from a WWW-Authenticate Bearer challenge
+/// (e.g. `Bearer error="invalid_token", scope="openid profile"`).
+pub fn parseWwwAuthenticateScope(header: []const u8) ?[]const u8 {
+    const key = "scope";
+    var search_from: usize = 0;
+    while (std.ascii.indexOfIgnoreCase(header[search_from..], key)) |rel| {
+        const idx = search_from + rel;
+        // must not be part of a longer word (e.g. "resource_scope")
+        if (idx > 0 and (std.ascii.isAlphanumeric(header[idx - 1]) or header[idx - 1] == '_')) {
+            search_from = idx + key.len;
+            continue;
+        }
+        var rest = header[idx + key.len ..];
+        rest = std.mem.trimLeft(u8, rest, " \t");
+        if (rest.len == 0 or rest[0] != '=') return null;
+        rest = std.mem.trimLeft(u8, rest[1..], " \t");
+        if (rest.len == 0) return null;
+        if (rest[0] == '"') {
+            const end = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse return null;
+            return rest[1..end];
+        }
+        const end = std.mem.indexOfAny(u8, rest, ", \t") orelse rest.len;
+        return rest[0..end];
+    }
+    return null;
+}
+
 // ------------------------------------------------------------- token cache --
 
 /// Per-user token cache directory: $XDG_DATA_HOME/mcp-bridge/tokens

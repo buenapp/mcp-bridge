@@ -161,6 +161,12 @@ test "oauth: parseWwwAuthenticateResourceMetadata" {
     try std.testing.expectEqualStrings("https://x.example.com/meta", oauth.parseWwwAuthenticateResourceMetadata(wa2).?);
 }
 
+test "oauth: parseWwwAuthenticateScope" {
+    const wa = "Bearer error=\"invalid_token\", resource_metadata=\"https://x/.well-known/oauth-protected-resource\", scope=\"openid profile email mcp:custom-audience\"";
+    try std.testing.expectEqualStrings("openid profile email mcp:custom-audience", oauth.parseWwwAuthenticateScope(wa).?);
+    try std.testing.expect(oauth.parseWwwAuthenticateScope("Bearer realm=\"x\"") == null);
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 

@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("crypt32", .{});
         exe.root_module.linkSystemLibrary("dnsapi", .{});
         exe.root_module.linkSystemLibrary("kernel32", .{});
+        exe.root_module.linkSystemLibrary("shell32", .{}); // ShellExecuteA (OAuth browser launch)
     } else {
         // POSIX: OpenSSL TLS backend. libc is required for @cImport and the
         // system resolver. FreeBSD has res_query/ns_* in libc; glibc needs
@@ -99,6 +100,7 @@ pub fn build(b: *std.Build) void {
         tests.root_module.linkSystemLibrary("crypt32", .{});
         tests.root_module.linkSystemLibrary("dnsapi", .{});
         tests.root_module.linkSystemLibrary("kernel32", .{});
+        tests.root_module.linkSystemLibrary("shell32", .{});
     } else {
         tests.root_module.link_libc = true;
         if (b.graph.host.result.os.tag == .freebsd) {
