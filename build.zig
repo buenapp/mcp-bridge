@@ -9,13 +9,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Pin glibc >= 2.39 for Linux CROSS builds only: the sysroot OpenSSL
-    // (Ubuntu 24.04) references versioned symbols (e.g. stat@GLIBC_2.33,
-    // __isoc23_strtol@GLIBC_2.38) that zig's older default baseline lacks.
-    // Native Linux builds use the system toolchain and must NOT be pinned
-    // (a 2.39-pinned binary can't run on older-glibc build hosts).
-    if (!target.query.isNative() and target.result.os.tag == .linux and
-        target.result.abi == .gnu and target.query.glibc_version == null)
+    // Pin glibc >= 2.39 for ALL linux-gnu builds. Two reasons:
+    // 1. Cross builds: the sysroot OpenSSL (Ubuntu 24.04) references
+    //    versioned symbols (stat@GLIBC_2.33, __isoc23_strtol@GLIBC_2.38)
+    //    that zig's older default baseline lacks.
+    // 2. Native builds: zig folds libresolv into libc for glibc >= 2.34
+    //    targets, but its default-baseline libc abilist lacks ns_initparse
+    //    /ns_parserr — with the default baseline the linker silently drops
+    //    -lresolv and the link fails. The 2.39 abilist has them.
+    // Symbol versions we use are ancient, so the binary still runs on
+    // older glibc (>= 2.36 verified in CI on bookworm).
+    if (target.result.os.tag == .linux and target.result.abi == .gnu and
+        target.query.glibc_version == null)
     {
         var q = target.query;
         q.glibc_version = .{ .major = 2, .minor = 39, .patch = 0 };

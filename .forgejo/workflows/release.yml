@@ -273,6 +273,9 @@ jobs:
   # natively here instead of in the jail.)
   linux-packages:
     runs-on: ubuntu-24.04
+    # node:24-trixie (glibc 2.41) so the glibc-2.39-pinned binary can run
+    # for the smoke test; the act default (bookworm, glibc 2.36) is too old.
+    container: node:24-trixie
     needs: build-and-release
     steps:
       # act containers (node:*-bookworm) lack ca-certificates, and
@@ -339,8 +342,8 @@ jobs:
       - name: Unit tests
         run: zig build test
 
-      - name: Build (ReleaseSafe, native)
-        run: zig build -Dtarget=native -Doptimize=ReleaseSafe
+      - name: Build (ReleaseSafe)
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 
       # PKI positive against a public host, fail-closed against a local
       # self-signed server. DANE-positive E2E needs a TLSA-publishing host
