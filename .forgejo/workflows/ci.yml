@@ -123,13 +123,22 @@ jobs:
         run: |
           SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
           $SUDO apt-get install -y -qq openssl
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
-            | ./zig-out/bin/mcp-bridge https://www.huque.com/ --verbose 2>&1 | grep -q "DANE result: success"
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
-            | ./zig-out/bin/mcp-bridge https://github.com/mcp --verbose 2>&1 | grep -q "certificate accepted"
+          PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
+          smoke() {
+            name="$1"; url="$2"; expect="$3"
+            out=$(printf '%s\n' "$PAYLOAD" | ./zig-out/bin/mcp-bridge "$url" --verbose 2>&1)
+            if echo "$out" | grep -q "$expect"; then
+              echo "SMOKE $name: PASS"
+            else
+              echo "SMOKE $name: FAIL (expected '$expect')"
+              echo "$out" | tail -15
+              exit 1
+            fi
+          }
+          smoke dane https://www.huque.com/ "DANE result: success"
+          smoke pki https://github.com/mcp "certificate accepted"
           openssl req -x509 -newkey rsa:2048 -keyout /tmp/ssk.pem -out /tmp/ssc.pem -days 1 -nodes -subj "/CN=localhost" 2>/dev/null
           openssl s_server -www -accept 24431 -cert /tmp/ssc.pem -key /tmp/ssk.pem & SRV=$!
           sleep 1
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
-            | ./zig-out/bin/mcp-bridge https://localhost:24431/ 2>&1 | grep -q "PkiValidationFailed"
+          smoke fail-closed https://localhost:24431/ "PkiValidationFailed"
           kill $SRV 2>/dev/null || true
