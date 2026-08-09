@@ -102,10 +102,18 @@ jobs:
           zig version
 
       - name: Unit tests
-        run: zig build test
+        run: |
+          echo "STEP tests begin"
+          zig build test 2>&1; rc=$?
+          echo "STEP tests rc=$rc"
+          exit $rc
 
       - name: Build (ReleaseSafe, native)
-        run: zig build -Dtarget=native -Doptimize=ReleaseSafe
+        run: |
+          echo "STEP build begin"
+          zig build -Dtarget=native -Doptimize=ReleaseSafe 2>&1; rc=$?
+          echo "STEP build rc=$rc"
+          exit $rc
 
       # DANE positive via the long-standing public DANE test host
       # (www.huque.com publishes TLSA on 443), PKI positive via github.com,
