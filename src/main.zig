@@ -1,9 +1,10 @@
-// mcp-bridge: MCP stdio <-> HTTP(S) bridge for Windows.
+// mcp-bridge: MCP stdio <-> HTTP(S) bridge (Windows, FreeBSD, Linux).
 //
 // Reads newline-delimited JSON-RPC from stdin, POSTs each message to a
 // remote MCP server (Streamable HTTP transport), writes each JSON response
-// to stdout. TLS via SChannel with DANE TLSA verification (DANE-TA/DANE-EE,
-// no DNSSEC) and Windows root-store PKI fallback when no TLSA is published.
+// to stdout. TLS with DANE TLSA verification (DANE-TA/DANE-EE, no DNSSEC)
+// and root-store PKI fallback when no TLSA is published. Platform backends:
+// SChannel/crypt32 on Windows, OpenSSL on POSIX (see platform.zig).
 //
 // Usage:
 //   mcp-bridge.exe <url> [--header "Name: Value"]... [--verbose]
@@ -13,13 +14,9 @@
 //               "args": ["https://mcp.example.com/mcp"] }
 
 const std = @import("std");
-const win = @import("win.zig");
-const schannel = @import("schannel.zig");
-const plain = @import("plain.zig");
+const platform = @import("platform.zig");
 const http = @import("http.zig");
 const mcp = @import("mcp.zig");
-const dane = @import("dane.zig");
-const dns = @import("dns.zig");
 
 const log = std.log.scoped(.bridge);
 
@@ -72,56 +69,7 @@ fn parseUrl(url: []const u8) !Target {
     return .{ .secure = secure, .host = host, .port = port, .path = path };
 }
 
-/// Certificate verification: DANE TLSA first (cached lookup), then Windows
-/// root-store PKI fallback when no TLSA records are published.
-const Verifier = struct {
-    alloc: std.mem.Allocator,
-    host: []const u8,
-    host_w: [:0]const u16,
-    port: u16,
-    verbose: bool,
-    tlsa: ?[]dane.TlsaRecord = null,
-
-    fn verifyOpaque(ctx_ptr: *anyopaque, leaf: *win.CERT_CONTEXT) bool {
-        const self: *Verifier = @ptrCast(@alignCast(ctx_ptr));
-        return self.verify(leaf) catch |err| {
-            log.err("certificate verification error: {s}", .{@errorName(err)});
-            return false;
-        };
-    }
-
-    fn verify(self: *Verifier, leaf: *win.CERT_CONTEXT) !bool {
-        if (self.tlsa == null) {
-            self.tlsa = dns.lookupTlsa(self.alloc, self.host, self.port) catch |err| {
-                // DNS lookup ERROR (not "no records") → fail closed.
-                log.err("TLSA lookup failed for {s}: {s}", .{ self.host, @errorName(err) });
-                if (self.verbose) std.debug.print("mcp-bridge: TLSA lookup error, refusing connection\n", .{});
-                return err;
-            };
-            if (self.verbose) {
-                std.debug.print("mcp-bridge: {d} TLSA record(s) for _{d}._tcp.{s}\n", .{ self.tlsa.?.len, self.port, self.host });
-            }
-        }
-        const records = self.tlsa.?;
-
-        const built = try dane.buildChain(leaf);
-        defer dane.freeChain(built.chain, built.certs);
-
-        if (records.len > 0) {
-            const result = dane.verifyChainDane(self.alloc, records, built.certs);
-            if (self.verbose) {
-                std.debug.print("mcp-bridge: DANE result: {s}\n", .{@tagName(result)});
-            }
-            return result == .success;
-        }
-
-        // No TLSA published → normal PKI against Windows root store.
-        if (self.verbose) std.debug.print("mcp-bridge: no TLSA, PKI fallback via Windows root store\n", .{});
-        return dane.verifyChainPki(built.chain, self.host_w);
-    }
-};
-
-fn readLineFromStdin(alloc: std.mem.Allocator, stdin_h: win.HANDLE, carry: *std.ArrayList(u8)) !?[]u8 {
+fn readLineFromStdin(alloc: std.mem.Allocator, carry: *std.ArrayList(u8)) !?[]u8 {
     // Returns the next complete line (without \n / \r), or null on EOF.
     while (true) {
         if (std.mem.indexOfScalar(u8, carry.items, '\n')) |nl| {
@@ -134,9 +82,8 @@ fn readLineFromStdin(alloc: std.mem.Allocator, stdin_h: win.HANDLE, carry: *std.
             return owned;
         }
         var tmp: [16384]u8 = undefined;
-        var nread: win.DWORD = 0;
-        const ok = win.ReadFile(stdin_h, &tmp, tmp.len, &nread, null);
-        if (ok == 0 or nread == 0) {
+        const nread = try platform.readStdin(&tmp);
+        if (nread == 0) {
             // EOF: flush any unterminated remainder
             if (carry.items.len > 0) {
                 var line = carry.items;
@@ -151,20 +98,11 @@ fn readLineFromStdin(alloc: std.mem.Allocator, stdin_h: win.HANDLE, carry: *std.
     }
 }
 
-fn writeStdout(bytes: []const u8) !void {
-    const stdout_h = win.GetStdHandle(win.STD_OUTPUT_HANDLE) orelse return error.NoStdout;
-    var off: usize = 0;
-    while (off < bytes.len) {
-        var written: win.DWORD = 0;
-        if (win.WriteFile(stdout_h, bytes.ptr + off, @intCast(bytes.len - off), &written, null) == 0)
-            return error.WriteFailed;
-        off += written;
-    }
-}
+const writeStdout = platform.writeStdoutAll;
 
 const Conn = union(enum) {
-    tls: schannel.TlsStream,
-    plain: plain.PlainStream,
+    tls: platform.TlsStream,
+    plain: platform.PlainStream,
 
     fn deinit(self: *Conn) void {
         switch (self.*) {
@@ -177,7 +115,7 @@ const Conn = union(enum) {
 const Bridge = struct {
     alloc: std.mem.Allocator,
     cfg: *const Config,
-    verifier: ?*Verifier,
+    verifier: ?*platform.Verifier,
     conn: ?Conn = null,
     session_id: ?[]const u8 = null,
 
@@ -201,10 +139,10 @@ const Bridge = struct {
         if (self.conn != null) return;
         const t = self.cfg.target;
         if (t.secure) {
-            const tls = try schannel.connect(self.alloc, t.host, t.port, @ptrCast(self.verifier.?), Verifier.verifyOpaque);
+            const tls = try platform.connectTls(self.alloc, t.host, t.port, self.verifier.?);
             self.conn = .{ .tls = tls };
         } else {
-            const ps = try plain.PlainStream.connect(self.alloc, t.host, t.port);
+            const ps = try platform.PlainStream.connect(self.alloc, t.host, t.port);
             self.conn = .{ .plain = ps };
         }
         if (self.cfg.verbose) std.debug.print("mcp-bridge: connected\n", .{});
@@ -304,9 +242,7 @@ pub fn main() !void {
         }
     }
     cfg.target = parseUrl(url orelse usage()) catch usage();
-    schannel.verbose = cfg.verbose;
-    dns.verbose = cfg.verbose;
-    dane.verbose = cfg.verbose;
+    platform.setVerbose(cfg.verbose);
 
     if (cfg.verbose) {
         std.debug.print("mcp-bridge: {s}://{s}:{d}{s}\n", .{
@@ -318,19 +254,13 @@ pub fn main() !void {
     }
 
     // Verifier (TLS only)
-    var verifier: ?Verifier = null;
+    var verifier: ?platform.Verifier = null;
     if (cfg.target.secure) {
-        const host_w = win.utf16Z(alloc, cfg.target.host) catch return error.Utf16;
-        verifier = .{
-            .alloc = alloc,
-            .host = cfg.target.host,
-            .host_w = host_w,
-            .port = cfg.target.port,
-            .verbose = cfg.verbose,
+        verifier = platform.Verifier.init(alloc, cfg.target.host, cfg.target.port, cfg.verbose) catch |err| {
+            log.err("verifier init failed: {s}", .{@errorName(err)});
+            return err;
         };
     }
-
-    const stdin_h = win.GetStdHandle(win.STD_INPUT_HANDLE) orelse return error.NoStdin;
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(alloc);
@@ -343,7 +273,7 @@ pub fn main() !void {
     defer bridge.deinit();
 
     while (true) {
-        const maybe_line = readLineFromStdin(alloc, stdin_h, &carry) catch null;
+        const maybe_line = readLineFromStdin(alloc, &carry) catch null;
         const line = maybe_line orelse break;
         defer alloc.free(line);
         if (line.len == 0) continue;
