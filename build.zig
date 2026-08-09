@@ -78,6 +78,10 @@ pub fn build(b: *std.Build) void {
                 exe.root_module.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/lib/libcrypto.so", .{sysroot}) catch @panic("oom") });
             } else |_| {
                 if (target.result.cpu.arch == .x86_64) {
+                    // An explicit linux target on a Linux host makes zig use
+                    // bundled glibc headers and skips /usr/include — add both
+                    // the plain and multiarch include dirs for OpenSSL.
+                    exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
                     exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
                     exe.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
                 }
