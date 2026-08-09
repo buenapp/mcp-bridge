@@ -89,6 +89,9 @@ pub const TlsStream = struct {
             if (n == 0) return 0; // TCP closed
             if (n == ws2.SOCKET_ERROR) {
                 if (@intFromEnum(ws2.WSAGetLastError()) == win.WSAETIMEDOUT) return TlsError.Timeout;
+                // forceShutdown() from another thread surfaces as
+                // WSAESHUTDOWN: report a clean close so the pump exits.
+                if (@intFromEnum(ws2.WSAGetLastError()) == win.WSAESHUTDOWN) return 0;
                 return TlsError.TlsError;
             }
             self.enc_buf.appendSlice(self.alloc, tmp[0..@intCast(n)]) catch return TlsError.OutOfMemory;
@@ -241,6 +244,12 @@ pub const TlsStream = struct {
             if (n <= 0) return TlsError.TlsError;
             off += @intCast(n);
         }
+    }
+
+    /// Abruptly unblock a recv blocked in ANOTHER thread (pump teardown).
+    /// Socket-level shutdown only — SChannel state is not thread-safe.
+    pub fn forceShutdown(self: *TlsStream) void {
+        if (self.sock != win.INVALID_SOCKET) _ = ws2.shutdown(self.sock, ws2.SD_BOTH);
     }
 };
 

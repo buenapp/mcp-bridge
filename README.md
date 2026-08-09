@@ -4,7 +4,8 @@
 
 MCP stdio bridge for **Windows, FreeBSD, and Linux**: connects MCP clients
 that only speak stdio (IDEs like Windsurf/Devin/Claude) to remote MCP
-servers over HTTP(S) **Streamable HTTP** transport — without Node.js.
+servers over HTTP(S) — **Streamable HTTP** (2025-03-26) and the legacy
+**HTTP+SSE** transport (2024-11-05) — without Node.js.
 
 TLS uses **SChannel** (Windows) or **OpenSSL** (POSIX) with **DANE TLSA**
 verification (DANE-TA and DANE-EE, usages 0–3, selectors CERT/SPKI,
@@ -90,7 +91,7 @@ back in once before `mcp-bridge` resolves by name. You can verify with
 ## Usage
 
 ```
-mcp-bridge <url> [--header "Name: Value"]... [--verbose]
+mcp-bridge <url> [--header "Name: Value"]... [--transport T] [--verbose]
 ```
 
 Example `mcp_config.json` entry:
@@ -125,6 +126,35 @@ This bridge targets stdio-only clients like Claude Desktop
 ```
 
 Diagnostics go to stderr (`--verbose`), stdout carries only JSON-RPC.
+
+## Transports
+
+`--transport` accepts the same four strategies as `mcp-remote`:
+
+| Value | Behavior |
+| --- | --- |
+| `http-first` (default) | POST with Streamable HTTP; on **404/405** fall back to the legacy HTTP+SSE transport on the same URL |
+| `http-only` | Streamable HTTP only, never fall back |
+| `sse-first` | Probe the legacy event stream first (`GET`, `Accept: text/event-stream`); on 404/405 use Streamable HTTP |
+| `sse-only` | Legacy HTTP+SSE only |
+
+Legacy HTTP+SSE (the deprecated 2024-11-05 transport, still common in
+deployed servers): the bridge opens a long-lived `GET` event stream, takes
+the per-session POST URL from the stream's `endpoint` event, POSTs
+client→server messages there (the server answers `202`), and reads
+responses and server-pushed messages off the stream as they arrive. A
+background pump thread keeps the stream flowing while the client is idle,
+so server-initiated messages (e.g. `tools/list_changed`, sampling
+requests) are never missed; if the stream drops, the next message
+reconnects with `Last-Event-ID` resumability.
+
+In Streamable HTTP mode the bridge additionally opens the **standalone
+GET event stream** after `initialize` (when the server supports it), so
+server-initiated messages arrive even between requests. Servers without
+it (HTTP 405) are tolerated silently.
+
+OAuth and DANE apply to both transports and to every connection they
+open.
 
 ## OAuth 2.1
 
@@ -170,6 +200,7 @@ then open the URL manually.
 --oauth-scope SCOPES        scopes to request (else the server's 401 scope)
 --oauth-grant GRANT         authorization_code | client_credentials (default: auto)
 --resource URI              RFC 8707 resource indicator (default: the server URL)
+--transport T               http-first (default) | http-only | sse-first | sse-only
 --config PATH               JSON config file
 --oauth-logout              delete cached tokens for <url> and exit
 ```
@@ -200,7 +231,8 @@ flags override file values:
       "client_id": "my-client",
       "scope": "openid profile",
       "resource": "https://tenant1.example.net/",
-      "grant": "authorization_code"
+      "grant": "authorization_code",
+      "transport": "sse-only"
     }
   }
 }
@@ -209,10 +241,16 @@ flags override file values:
 ## Protocol behavior
 
 - stdin: newline-delimited JSON-RPC (one message per line)
-- Each message is POSTed to the URL with `Content-Type: application/json`,
+- Streamable HTTP: each message is POSTed to the URL with
+  `Content-Type: application/json`,
   `Accept: application/json, text/event-stream` (plain JSON and SSE-framed
-  responses both supported)
-- `MCP-Session-Id` from the initialize response is sent on later requests
+  responses both supported); `MCP-Session-Id` from the initialize response
+  is sent on later requests; after initialize, a standalone GET event
+  stream is opened for server-initiated messages when the server offers one
+- Legacy HTTP+SSE: a background pump thread owns the `GET` event stream;
+  messages are POSTed to the per-session endpoint from the stream's
+  `endpoint` event; responses are correlated by JSON-RPC id and may arrive
+  in any order; dropped streams reconnect with `Last-Event-ID`
 - Response bodies are written to stdout, one line each; notifications
   (HTTP 202, empty body) produce no output
 - Transport errors produce a synthesized JSON-RPC error on stdout

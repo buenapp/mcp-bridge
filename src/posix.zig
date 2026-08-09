@@ -108,6 +108,13 @@ pub const PlainStream = struct {
         _ = self;
     }
 
+    /// Abruptly unblock a read() blocked in ANOTHER thread (pump
+    /// teardown). shutdown() wakes the blocked recv immediately, unlike
+    /// close().
+    pub fn forceShutdown(self: *PlainStream) void {
+        if (self.sock >= 0) std.posix.shutdown(self.sock, .both) catch {};
+    }
+
     pub fn deinit(self: *PlainStream) void {
         if (self.sock >= 0) std.posix.close(self.sock);
         self.sock = -1;

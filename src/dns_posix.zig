@@ -167,9 +167,10 @@ pub fn freeTlsaRecords(alloc: std.mem.Allocator, records: []dane.TlsaRecord) voi
 }
 
 test "skipName: plain, compressed, truncated" {
-    // "\x03www\x07example\x03com\x00" then a byte
+    // "\x03www\x07example\x03com\x00" then a byte; the offset returned is
+    // just PAST the terminating zero (17), where the next field starts.
     const plain = "\x03www\x07example\x03com\x00Z";
-    try std.testing.expectEqual(@as(?usize, 16), skipName(plain, 0));
+    try std.testing.expectEqual(@as(?usize, 17), skipName(plain, 0));
     // compression pointer
     const comp = "\xc0\x0cZZ";
     try std.testing.expectEqual(@as(?usize, 2), skipName(comp, 0));

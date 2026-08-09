@@ -92,6 +92,13 @@ pub const TlsStream = struct {
     pub fn closeNotify(self: *TlsStream) void {
         if (self.ssl) |s| _ = c.SSL_shutdown(s);
     }
+
+    /// Abruptly unblock an SSL_read blocked in ANOTHER thread (pump
+    /// teardown). Shuts down the underlying socket directly — no
+    /// close_notify, no OpenSSL state touched (not thread-safe).
+    pub fn forceShutdown(self: *TlsStream) void {
+        if (self.sock >= 0) std.posix.shutdown(self.sock, .both) catch {};
+    }
 };
 
 /// Thread-local C errno (set by the underlying socket syscalls OpenSSL made).

@@ -12,7 +12,8 @@
 //       "client_secret": "...",   // optional (public clients omit)
 //       "scope": "openid profile",// optional
 //       "resource": "https://tenant.example.net/", // optional RFC 8707 resource
-//       "grant": "authorization_code"              // optional: authorization_code|client_credentials
+//       "grant": "authorization_code",             // optional: authorization_code|client_credentials
+//       "transport": "sse-only"                    // optional: http-first|http-only|sse-first|sse-only
 //     }
 //   }
 // }
@@ -27,6 +28,7 @@ pub const ServerConfig = struct {
     scope: ?[]const u8 = null,
     resource: ?[]const u8 = null,
     grant: ?[]const u8 = null,
+    transport: ?[]const u8 = null, // http-first|http-only|sse-first|sse-only
 };
 
 pub const ConfigFile = struct {
@@ -116,6 +118,7 @@ fn parseServer(v: std.json.Value) !ServerConfig {
     if (obj.get("scope")) |s| sc.scope = try strOrNull(s);
     if (obj.get("resource")) |s| sc.resource = try strOrNull(s);
     if (obj.get("grant")) |s| sc.grant = try strOrNull(s);
+    if (obj.get("transport")) |s| sc.transport = try strOrNull(s);
     return sc;
 }
 
@@ -133,7 +136,7 @@ test "load: parse, exact + origin lookup" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = 
         \\{"servers":{
-        \\  "https://a.example.com/mcp": {"oauth": true, "client_id": "cid", "scope": "s1", "resource": "https://t1.example.net/", "grant": "authorization_code"},
+        \\  "https://a.example.com/mcp": {"oauth": true, "client_id": "cid", "scope": "s1", "resource": "https://t1.example.net/", "grant": "authorization_code", "transport": "sse-only"},
         \\  "https://b.example.com": {"oauth": true, "client_secret": "sec"}
         \\}}
     });
@@ -149,12 +152,14 @@ test "load: parse, exact + origin lookup" {
     try std.testing.expect(a.client_secret == null);
     try std.testing.expectEqualStrings("https://t1.example.net/", a.resource.?);
     try std.testing.expectEqualStrings("authorization_code", a.grant.?);
+    try std.testing.expectEqualStrings("sse-only", a.transport.?);
 
     // origin fallback
     const b = cf.lookup("https://b.example.com/other/path").?;
     try std.testing.expectEqualStrings("sec", b.client_secret.?);
     try std.testing.expect(b.resource == null);
     try std.testing.expect(b.grant == null);
+    try std.testing.expect(b.transport == null);
 
     try std.testing.expect(cf.lookup("https://c.example.com/mcp") == null);
 }

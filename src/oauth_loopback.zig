@@ -332,7 +332,13 @@ fn shellExecute(url: []const u8) bool {
 
 test "urlDecode: percent, plus, malformed" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqualStrings("a b+c/d=e", try urlDecode(alloc, "a%20b%2Bc%2Fd%3De"));
-    try std.testing.expectEqualStrings("plain", try urlDecode(alloc, "plain"));
-    try std.testing.expectEqualStrings("100%", try urlDecode(alloc, "100%25"));
+    const d1 = try urlDecode(alloc, "a%20b%2Bc%2Fd%3De");
+    defer alloc.free(d1);
+    try std.testing.expectEqualStrings("a b+c/d=e", d1);
+    const d2 = try urlDecode(alloc, "plain");
+    defer alloc.free(d2);
+    try std.testing.expectEqualStrings("plain", d2);
+    const d3 = try urlDecode(alloc, "100%25");
+    defer alloc.free(d3);
+    try std.testing.expectEqualStrings("100%", d3);
 }

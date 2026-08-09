@@ -61,6 +61,11 @@ pub const PlainStream = struct {
         _ = self;
     }
 
+    /// Abruptly unblock a recv blocked in ANOTHER thread (pump teardown).
+    pub fn forceShutdown(self: *PlainStream) void {
+        if (self.sock != win.INVALID_SOCKET) _ = ws2.shutdown(self.sock, ws2.SD_BOTH);
+    }
+
     pub fn deinit(self: *PlainStream) void {
         if (self.sock != win.INVALID_SOCKET) _ = ws2.closesocket(self.sock);
         self.sock = win.INVALID_SOCKET;

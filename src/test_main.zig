@@ -6,10 +6,14 @@ const mcp = @import("mcp.zig");
 const pkce = @import("pkce.zig");
 const oauth = @import("oauth.zig");
 const config = @import("config.zig");
+const sse = @import("sse.zig");
+const test_transport = @import("test_transport.zig");
 
 comptime {
     _ = pkce;
     _ = config;
+    _ = sse;
+    _ = test_transport;
 }
 
 fn spkiStub(alloc: std.mem.Allocator, cert_der: []const u8) anyerror![]u8 {

@@ -50,6 +50,7 @@ pub const SOL_SOCKET: i32 = 0xffff;
 pub const SO_RCVTIMEO: i32 = 0x1006;
 pub const SO_SNDTIMEO: i32 = 0x1005;
 pub const WSAETIMEDOUT: i32 = 10060;
+pub const WSAESHUTDOWN: i32 = 10058;
 
 /// Set blocking recv/send timeouts (milliseconds) on a socket.
 pub fn setTimeouts(sock: SOCKET, recv_ms: u32, send_ms: u32) void {
