@@ -751,7 +751,11 @@ pub const Bridge = struct {
                 conn.deinit();
                 return;
             }
-            if (stream.status == 401 and !auth_retried) {
+            if (stream.status == 401 and !auth_retried and
+                (self.cfg.oauth != null or self.tokens != null))
+            {
+                // Push is optional: only chase auth when OAuth is already
+                // in play — never pop a surprise browser flow for it.
                 auth_retried = true;
                 const wa = if (stream.www_authenticate) |h| try self.alloc.dupe(u8, h) else null;
                 defer if (wa) |h| self.alloc.free(h);
