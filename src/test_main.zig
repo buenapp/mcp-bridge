@@ -1,19 +1,25 @@
 // Host-side unit tests for platform-independent modules.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dane = @import("dane.zig");
 const mcp = @import("mcp.zig");
 const pkce = @import("pkce.zig");
 const oauth = @import("oauth.zig");
 const config = @import("config.zig");
 const sse = @import("sse.zig");
+const evport = @import("evport.zig");
 const test_transport = @import("test_transport.zig");
 
 comptime {
     _ = pkce;
     _ = config;
     _ = sse;
+    _ = evport;
     _ = test_transport;
+    // Backend tests live in the per-platform files; reference the one for
+    // this host so its tests are discovered.
+    if (builtin.os.tag == .freebsd) _ = @import("evport_kqueue.zig");
 }
 
 fn spkiStub(alloc: std.mem.Allocator, cert_der: []const u8) anyerror![]u8 {
