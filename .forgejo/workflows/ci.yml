@@ -27,3 +27,9 @@ jobs:
           file zig-out/bin/mcp-bridge.exe
           ls -la zig-out/bin/mcp-bridge.exe
           readelf -S zig-out/bin/mcp-bridge.exe | grep -i rsrc
+
+      - name: Build (ReleaseSafe, x86_64-freebsd)
+        run: |
+          zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseSafe --prefix /tmp/mcp-bridge-fbsd
+          file /tmp/mcp-bridge-fbsd/bin/mcp-bridge
+          readelf -d /tmp/mcp-bridge-fbsd/bin/mcp-bridge | grep NEEDED

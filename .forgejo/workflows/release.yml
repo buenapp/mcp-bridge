@@ -34,6 +34,14 @@ jobs:
           file zig-out/bin/mcp-bridge.exe
           ls -l zig-out/bin/mcp-bridge.exe
 
+      - name: Build mcp-bridge (FreeBSD, ReleaseSafe)
+        run: |
+          zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseSafe --prefix "$GITHUB_WORKSPACE/dist-freebsd"
+          file dist-freebsd/bin/mcp-bridge
+          # Must link BASE OpenSSL (certctl trust), never ports libssl.so.12
+          readelf -d dist-freebsd/bin/mcp-bridge | grep NEEDED
+          ! readelf -d dist-freebsd/bin/mcp-bridge | grep -q "libssl.so.12"
+
       # --- Authenticode signing (osslsigncode, FreeBSD native) ---
       - name: Install osslsigncode
         run: |
@@ -88,7 +96,7 @@ jobs:
 
           doas jexec "$JAIL" sh -c 'echo "APT::Cache-Start \"100000000\";" > /etc/apt/apt.conf.d/99cache'
           doas jexec "$JAIL" apt-get update -qq
-          doas jexec "$JAIL" apt-get install -y -qq nsis
+          doas jexec "$JAIL" apt-get install -y -qq nsis libssl-dev
 
       - name: Build NSIS installer
         run: |
@@ -108,6 +116,27 @@ jobs:
           cp "$JPATH/tmp/build/mcp-bridge-${VERSION}-setup.exe" .
           file "mcp-bridge-${VERSION}-setup.exe"
           ls -l "mcp-bridge-${VERSION}-setup.exe"
+
+      # --- Linux binary: cross-build on host (zig deadlocks under the
+      # Linuxulator), using the jail's libssl-dev as the OpenSSL sysroot ---
+      - name: Build mcp-bridge (Linux x86_64, ReleaseSafe)
+        run: |
+          JPATH="$JAIL_ROOT/$LINUX_JAIL"
+          SYSROOT="$GITHUB_WORKSPACE/.sysroot/ubuntu-24.04"
+          mkdir -p "$SYSROOT/include" "$SYSROOT/lib"
+          cp -r "$JPATH/usr/include/openssl" "$SYSROOT/include/"
+          cp -r "$JPATH/usr/include/x86_64-linux-gnu/openssl/." "$SYSROOT/include/openssl/"
+          cp -L "$JPATH/usr/lib/x86_64-linux-gnu/libssl.so" "$SYSROOT/lib/"
+          cp -L "$JPATH/usr/lib/x86_64-linux-gnu/libcrypto.so" "$SYSROOT/lib/"
+
+          zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix "$GITHUB_WORKSPACE/dist-linux"
+          file dist-linux/bin/mcp-bridge
+          readelf -d dist-linux/bin/mcp-bridge | grep NEEDED
+          readelf -d dist-linux/bin/mcp-bridge | grep -q "libssl.so.3"
+
+          # Smoke test the Linux binary inside the jail
+          cp dist-linux/bin/mcp-bridge "$JPATH/tmp/"
+          doas jexec "$LINUX_JAIL" /tmp/mcp-bridge 2>&1 | head -2 || true
 
       - name: Tear down Linux jail
         if: always()
@@ -168,7 +197,7 @@ jobs:
 
           # Create release
           RESP=$(curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
-            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"## MCP Bridge $TAG\\n\\nCommit: $GITHUB_SHA\\n\\n### Downloads\\n- **mcp-bridge-${VERSION}-setup.exe** — Windows installer (per-user, no admin)\\n- **mcp-bridge-${VERSION}.exe** — standalone binary\\n\\nBoth are Authenticode-signed.\",\"draft\":false,\"prerelease\":$PRERELEASE}" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"## MCP Bridge $TAG\\n\\nCommit: $GITHUB_SHA\\n\\n### Downloads\\n- **mcp-bridge-${VERSION}-setup.exe** — Windows installer (per-user, no admin)\\n- **mcp-bridge-${VERSION}.exe** — standalone Windows binary\\n- **mcp-bridge-${VERSION}-x86_64-freebsd** — FreeBSD binary (base OpenSSL, certctl trust)\\n- **mcp-bridge-${VERSION}-x86_64-linux** — Linux binary (glibc, distro OpenSSL 3)\\n\\nWindows assets are Authenticode-signed.\",\"draft\":false,\"prerelease\":$PRERELEASE}" \
             "$BASE_URL/releases")
           echo "Create release response: $RESP"
           RELEASE_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
@@ -191,3 +220,15 @@ jobs:
             --data-binary @zig-out/bin/mcp-bridge.exe \
             "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}.exe"
           echo "Uploaded standalone binary"
+
+          # Upload FreeBSD + Linux binaries
+          curl -s -X POST -H "$AUTH" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @dist-freebsd/bin/mcp-bridge \
+            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-x86_64-freebsd"
+          echo "Uploaded FreeBSD binary"
+          curl -s -X POST -H "$AUTH" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @dist-linux/bin/mcp-bridge \
+            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-x86_64-linux"
+          echo "Uploaded Linux binary"
