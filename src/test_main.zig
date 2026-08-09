@@ -193,30 +193,86 @@ test "oauth: token cache roundtrip + 0600 perms" {
     _ = setenv("XDG_DATA_HOME", base_z.ptr, 1);
 
     const url = "https://a.example.com/mcp";
-    const ts = oauth.TokenSet{ .access_token = "secret-at", .refresh_token = "secret-rt", .expires_at = 12345 };
-    try oauth.saveTokenCache(alloc, url, ts);
+    const ts = oauth.TokenSet{ .access_token = "secret-at", .refresh_token = "secret-rt", .expires_at = 12345, .client_id = "dcr-client-123" };
+    try oauth.saveTokenCache(alloc, url, null, ts);
 
     // Key stability
-    const p1 = try oauth.tokenPath(alloc, url);
+    const p1 = try oauth.tokenPath(alloc, url, null);
     defer alloc.free(p1);
-    const p3 = try oauth.tokenPath(alloc, "https://b.example.com/mcp");
+    const p3 = try oauth.tokenPath(alloc, "https://b.example.com/mcp", null);
     defer alloc.free(p3);
     try std.testing.expect(!std.mem.eql(u8, p1, p3));
     try std.testing.expect(std.mem.endsWith(u8, p1, ".json"));
+
+    // Resource namespacing: same URL + explicit resource -> different file
+    const pr = try oauth.tokenPath(alloc, url, "https://tenant1.example.net/");
+    defer alloc.free(pr);
+    try std.testing.expect(!std.mem.eql(u8, p1, pr));
 
     // 0600 perms
     const st = try std.fs.cwd().statFile(p1);
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.mode & 0o777)));
 
     // Roundtrip
-    const loaded = (try oauth.loadTokenCache(alloc, url)).?;
+    const loaded = (try oauth.loadTokenCache(alloc, url, null)).?;
     defer alloc.free(loaded.access_token);
     defer if (loaded.refresh_token) |r| alloc.free(r);
+    defer if (loaded.client_id) |c| alloc.free(c);
     try std.testing.expectEqualStrings("secret-at", loaded.access_token);
     try std.testing.expectEqualStrings("secret-rt", loaded.refresh_token.?);
     try std.testing.expectEqual(@as(i64, 12345), loaded.expires_at);
+    try std.testing.expectEqualStrings("dcr-client-123", loaded.client_id.?);
+
+    // Resource-namespaced cache is independent of the URL-only cache
+    const ts2 = oauth.TokenSet{ .access_token = "tenant1-at", .expires_at = 1 };
+    try oauth.saveTokenCache(alloc, url, "https://tenant1.example.net/", ts2);
+    const loaded2 = (try oauth.loadTokenCache(alloc, url, "https://tenant1.example.net/")).?;
+    defer alloc.free(loaded2.access_token);
+    try std.testing.expectEqualStrings("tenant1-at", loaded2.access_token);
+    // URL-only cache untouched
+    const loaded1b = (try oauth.loadTokenCache(alloc, url, null)).?;
+    defer alloc.free(loaded1b.access_token);
+    defer if (loaded1b.refresh_token) |r| alloc.free(r);
+    defer if (loaded1b.client_id) |c| alloc.free(c);
+    try std.testing.expectEqualStrings("secret-at", loaded1b.access_token);
+    try oauth.deleteTokenCache(alloc, url, "https://tenant1.example.net/");
+    try std.testing.expect((try oauth.loadTokenCache(alloc, url, "https://tenant1.example.net/")) == null);
 
     // Delete
-    try oauth.deleteTokenCache(alloc, url);
-    try std.testing.expect((try oauth.loadTokenCache(alloc, url)) == null);
+    try oauth.deleteTokenCache(alloc, url, null);
+    try std.testing.expect((try oauth.loadTokenCache(alloc, url, null)) == null);
+
+    // Backward compat: a pre-client_id cache file still loads, client_id null
+    const legacy_url = "https://legacy.example.com/mcp";
+    const legacy_path = try oauth.tokenPath(alloc, legacy_url, null);
+    defer alloc.free(legacy_path);
+    {
+        const f = try std.fs.cwd().createFile(legacy_path, .{ .truncate = true, .mode = 0o600 });
+        defer f.close();
+        try f.writeAll("{\"access_token\":\"old-at\",\"refresh_token\":\"old-rt\",\"expires_at\":99}");
+    }
+    const legacy = (try oauth.loadTokenCache(alloc, legacy_url, null)).?;
+    defer alloc.free(legacy.access_token);
+    defer if (legacy.refresh_token) |r| alloc.free(r);
+    try std.testing.expectEqualStrings("old-at", legacy.access_token);
+    try std.testing.expect(legacy.client_id == null);
+    try oauth.deleteTokenCache(alloc, legacy_url, null);
+}
+
+test "oauth: buildAuthUrl includes RFC 8707 resource when set" {
+    const alloc = std.testing.allocator;
+    const with = try oauth.buildAuthUrl(alloc, "https://as.example.com/authorize", "cid", "http://localhost:1234/callback", "chal", "state", "openid", "https://tenant1.example.net/");
+    defer alloc.free(with);
+    try std.testing.expect(std.mem.indexOf(u8, with, "resource=https%3A%2F%2Ftenant1.example.net%2F") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with, "code_challenge=chal") != null);
+
+    const without = try oauth.buildAuthUrl(alloc, "https://as.example.com/authorize", "cid", "http://localhost:1234/callback", "chal", "state", null, null);
+    defer alloc.free(without);
+    try std.testing.expect(std.mem.indexOf(u8, without, "resource=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, without, "scope=") == null);
+
+    // Endpoint already carrying a query string gets '&'
+    const q = try oauth.buildAuthUrl(alloc, "https://as.example.com/authorize?prompt=consent", "cid", "http://localhost/cb", "c", "s", null, null);
+    defer alloc.free(q);
+    try std.testing.expect(std.mem.indexOf(u8, q, "prompt=consent&") != null);
 }

@@ -10,7 +10,9 @@
 //       "oauth": true,
 //       "client_id": "...",       // optional; DCR when absent
 //       "client_secret": "...",   // optional (public clients omit)
-//       "scope": "openid profile" // optional
+//       "scope": "openid profile",// optional
+//       "resource": "https://tenant.example.net/", // optional RFC 8707 resource
+//       "grant": "authorization_code"              // optional: authorization_code|client_credentials
 //     }
 //   }
 // }
@@ -23,6 +25,8 @@ pub const ServerConfig = struct {
     client_id: ?[]const u8 = null,
     client_secret: ?[]const u8 = null,
     scope: ?[]const u8 = null,
+    resource: ?[]const u8 = null,
+    grant: ?[]const u8 = null,
 };
 
 pub const ConfigFile = struct {
@@ -110,6 +114,8 @@ fn parseServer(v: std.json.Value) !ServerConfig {
     if (obj.get("client_id")) |s| sc.client_id = try strOrNull(s);
     if (obj.get("client_secret")) |s| sc.client_secret = try strOrNull(s);
     if (obj.get("scope")) |s| sc.scope = try strOrNull(s);
+    if (obj.get("resource")) |s| sc.resource = try strOrNull(s);
+    if (obj.get("grant")) |s| sc.grant = try strOrNull(s);
     return sc;
 }
 
@@ -125,11 +131,11 @@ test "load: parse, exact + origin lookup" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data =
-    \\{"servers":{
-    \\  "https://a.example.com/mcp": {"oauth": true, "client_id": "cid", "scope": "s1"},
-    \\  "https://b.example.com": {"oauth": true, "client_secret": "sec"}
-    \\}}
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = 
+        \\{"servers":{
+        \\  "https://a.example.com/mcp": {"oauth": true, "client_id": "cid", "scope": "s1", "resource": "https://t1.example.net/", "grant": "authorization_code"},
+        \\  "https://b.example.com": {"oauth": true, "client_secret": "sec"}
+        \\}}
     });
     const path = try tmp.dir.realpathAlloc(alloc, "config.json");
     defer alloc.free(path);
@@ -141,10 +147,14 @@ test "load: parse, exact + origin lookup" {
     try std.testing.expect(a.oauth);
     try std.testing.expectEqualStrings("cid", a.client_id.?);
     try std.testing.expect(a.client_secret == null);
+    try std.testing.expectEqualStrings("https://t1.example.net/", a.resource.?);
+    try std.testing.expectEqualStrings("authorization_code", a.grant.?);
 
     // origin fallback
     const b = cf.lookup("https://b.example.com/other/path").?;
     try std.testing.expectEqualStrings("sec", b.client_secret.?);
+    try std.testing.expect(b.resource == null);
+    try std.testing.expect(b.grant == null);
 
     try std.testing.expect(cf.lookup("https://c.example.com/mcp") == null);
 }

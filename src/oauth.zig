@@ -60,6 +60,9 @@ pub const TokenSet = struct {
     refresh_token: ?[]const u8 = null,
     /// Unix time the access token expires; 0 = does not expire.
     expires_at: i64 = 0,
+    /// Client id the tokens were issued to (from DCR or config). Cached so a
+    /// later process can refresh without re-registering.
+    client_id: ?[]const u8 = null,
 
     pub fn isExpired(self: TokenSet, now: i64) bool {
         return self.expires_at != 0 and now >= self.expires_at;
@@ -236,9 +239,19 @@ pub fn tokensDir(alloc: std.mem.Allocator) ![]u8 {
 }
 
 /// Cache file path for a server URL: <tokens_dir>/<sha256hex>.json
-pub fn tokenPath(alloc: std.mem.Allocator, server_url: []const u8) ![]u8 {
+/// The hash input is the server URL alone when no explicit resource is
+/// configured (preserving pre-resource cache files), else "url\nresource".
+pub fn tokenPath(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(server_url, &digest, .{});
+    if (resource) |r| {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(server_url);
+        h.update("\n");
+        h.update(r);
+        h.final(&digest);
+    } else {
+        std.crypto.hash.sha2.Sha256.hash(server_url, &digest, .{});
+    }
     var hex: [64]u8 = undefined;
     const chars = "0123456789abcdef";
     for (digest, 0..) |b, i| {
@@ -251,8 +264,8 @@ pub fn tokenPath(alloc: std.mem.Allocator, server_url: []const u8) ![]u8 {
 }
 
 /// Load a cached token set. Returns null when absent or unparsable.
-pub fn loadTokenCache(alloc: std.mem.Allocator, server_url: []const u8) !?TokenSet {
-    const path = try tokenPath(alloc, server_url);
+pub fn loadTokenCache(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8) !?TokenSet {
+    const path = try tokenPath(alloc, server_url, resource);
     defer alloc.free(path);
     const text = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -272,16 +285,21 @@ pub fn loadTokenCache(alloc: std.mem.Allocator, server_url: []const u8) !?TokenS
         .integer => |i| i,
         else => 0,
     };
+    const client_id: ?[]const u8 = switch (obj.get("client_id") orelse .null) {
+        .string => |s| s,
+        else => null,
+    };
     return .{
         .access_token = try alloc.dupe(u8, access),
         .refresh_token = if (refresh_tok) |r| try alloc.dupe(u8, r) else null,
         .expires_at = expires_at,
+        .client_id = if (client_id) |c| try alloc.dupe(u8, c) else null,
     };
 }
 
 /// Persist a token set (0600, per-user dir). Contains bearer secrets.
-pub fn saveTokenCache(alloc: std.mem.Allocator, server_url: []const u8, tokens: TokenSet) !void {
-    const path = try tokenPath(alloc, server_url);
+pub fn saveTokenCache(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8, tokens: TokenSet) !void {
+    const path = try tokenPath(alloc, server_url, resource);
     defer alloc.free(path);
     if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch {};
 
@@ -289,12 +307,14 @@ pub fn saveTokenCache(alloc: std.mem.Allocator, server_url: []const u8, tokens: 
         access_token: []const u8,
         refresh_token: ?[]const u8 = null,
         expires_at: i64,
+        client_id: ?[]const u8 = null,
     };
     const text = try std.json.Stringify.valueAlloc(alloc, CacheFile{
         .access_token = tokens.access_token,
         .refresh_token = tokens.refresh_token,
         .expires_at = tokens.expires_at,
-    }, .{});
+        .client_id = tokens.client_id,
+    }, .{ .emit_null_optional_fields = false });
     defer alloc.free(text);
 
     const file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
@@ -305,8 +325,8 @@ pub fn saveTokenCache(alloc: std.mem.Allocator, server_url: []const u8, tokens: 
 }
 
 /// Delete a server's cached tokens (--oauth-logout).
-pub fn deleteTokenCache(alloc: std.mem.Allocator, server_url: []const u8) !void {
-    const path = try tokenPath(alloc, server_url);
+pub fn deleteTokenCache(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8) !void {
+    const path = try tokenPath(alloc, server_url, resource);
     defer alloc.free(path);
     std.fs.cwd().deleteFile(path) catch |err| switch (err) {
         error.FileNotFound => {},
@@ -424,6 +444,7 @@ pub fn clientCredentials(
     client_id: []const u8,
     client_secret: []const u8,
     scope: ?[]const u8,
+    resource: ?[]const u8,
 ) !TokenSet {
     var pairs: std.ArrayList([2][]const u8) = .empty;
     defer pairs.deinit(alloc);
@@ -431,6 +452,7 @@ pub fn clientCredentials(
     try pairs.append(alloc, .{ "client_id", client_id });
     try pairs.append(alloc, .{ "client_secret", client_secret });
     if (scope) |s| try pairs.append(alloc, .{ "scope", s });
+    if (resource) |r| try pairs.append(alloc, .{ "resource", r });
     return tokenRequest(alloc, token_endpoint, pairs.items);
 }
 
@@ -441,6 +463,7 @@ pub fn refresh(
     client_id: []const u8,
     client_secret: ?[]const u8,
     refresh_token: []const u8,
+    resource: ?[]const u8,
 ) !TokenSet {
     var pairs: std.ArrayList([2][]const u8) = .empty;
     defer pairs.deinit(alloc);
@@ -448,10 +471,12 @@ pub fn refresh(
     try pairs.append(alloc, .{ "refresh_token", refresh_token });
     try pairs.append(alloc, .{ "client_id", client_id });
     if (client_secret) |s| try pairs.append(alloc, .{ "client_secret", s });
+    if (resource) |r| try pairs.append(alloc, .{ "resource", r });
     return tokenRequest(alloc, token_endpoint, pairs.items);
 }
 
-/// Authorization Code + PKCE exchange.
+/// Authorization Code + PKCE exchange. client_secret is sent when the
+/// client is confidential (pre-registered); public/DCR clients pass null.
 pub fn exchangeCode(
     alloc: std.mem.Allocator,
     token_endpoint: []const u8,
@@ -459,6 +484,8 @@ pub fn exchangeCode(
     code: []const u8,
     redirect_uri: []const u8,
     code_verifier: []const u8,
+    client_secret: ?[]const u8,
+    resource: ?[]const u8,
 ) !TokenSet {
     var pairs: std.ArrayList([2][]const u8) = .empty;
     defer pairs.deinit(alloc);
@@ -466,8 +493,38 @@ pub fn exchangeCode(
     try pairs.append(alloc, .{ "code", code });
     try pairs.append(alloc, .{ "redirect_uri", redirect_uri });
     try pairs.append(alloc, .{ "client_id", client_id });
+    if (client_secret) |s| try pairs.append(alloc, .{ "client_secret", s });
     try pairs.append(alloc, .{ "code_verifier", code_verifier });
+    if (resource) |r| try pairs.append(alloc, .{ "resource", r });
     return tokenRequest(alloc, token_endpoint, pairs.items);
+}
+
+/// Build the authorization URL (authorization code + PKCE, RFC 8707
+/// resource indicator included when set).
+pub fn buildAuthUrl(
+    alloc: std.mem.Allocator,
+    endpoint: []const u8,
+    client_id: []const u8,
+    redirect_uri: []const u8,
+    challenge: []const u8,
+    state: []const u8,
+    scope: ?[]const u8,
+    resource: ?[]const u8,
+) ![]u8 {
+    var pairs: std.ArrayList([2][]const u8) = .empty;
+    defer pairs.deinit(alloc);
+    try pairs.append(alloc, .{ "response_type", "code" });
+    try pairs.append(alloc, .{ "client_id", client_id });
+    try pairs.append(alloc, .{ "redirect_uri", redirect_uri });
+    try pairs.append(alloc, .{ "state", state });
+    try pairs.append(alloc, .{ "code_challenge", challenge });
+    try pairs.append(alloc, .{ "code_challenge_method", "S256" });
+    if (scope) |s| try pairs.append(alloc, .{ "scope", s });
+    if (resource) |r| try pairs.append(alloc, .{ "resource", r });
+    const qs = try formEncode(alloc, pairs.items);
+    defer alloc.free(qs);
+    const sep: []const u8 = if (std.mem.indexOfScalar(u8, endpoint, '?') != null) "&" else "?";
+    return std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ endpoint, sep, qs });
 }
 
 /// RFC 7591 dynamic client registration (public client, loopback redirect).

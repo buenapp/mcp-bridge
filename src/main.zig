@@ -33,7 +33,14 @@ const OAuthCfg = struct {
     client_id: ?[]const u8 = null,
     client_secret: ?[]const u8 = null,
     scope: ?[]const u8 = null,
+    /// Explicit RFC 8707 resource indicator (--resource). When null the
+    /// server URL is sent as the resource but the token cache stays keyed
+    /// by URL alone (preserving pre-resource cache files).
+    resource: ?[]const u8 = null,
+    grant: Grant = .auto,
 };
+
+const Grant = enum { auto, authorization_code, client_credentials };
 
 const Config = struct {
     target: Target,
@@ -56,6 +63,8 @@ fn usage() noreturn {
         \\  --oauth-client-id ID    pre-registered client id (else DCR)
         \\  --oauth-client-secret S client secret (enables headless client-credentials)
         \\  --oauth-scope S         scopes to request
+        \\  --oauth-grant G         authorization_code | client_credentials (default: auto)
+        \\  --resource URI          RFC 8707 resource indicator (default: the server URL)
         \\  --config PATH           JSON config file (default: ~/.config/mcp-bridge/config.json)
         \\  --oauth-logout          delete cached tokens for <url> and exit
         \\
@@ -133,13 +142,38 @@ const Bridge = struct {
     /// use, refreshes expired tokens, and falls back to a full grant flow
     /// (client-credentials when a secret is configured, else interactive
     /// authorization code + PKCE).
+    /// RFC 8707 resource sent on the wire: the explicit --resource value,
+    /// else the server URL itself (per the MCP authorization spec).
+    fn wireResource(self: *Bridge) []const u8 {
+        return if (self.cfg.oauth) |o| o.resource orelse self.cfg.url else self.cfg.url;
+    }
+
+    /// Resource used for the token cache key: only an explicit --resource
+    /// namespaces the cache (multi-tenant); otherwise URL-only (legacy).
+    fn cacheResource(self: *Bridge) ?[]const u8 {
+        return if (self.cfg.oauth) |o| o.resource else null;
+    }
+
+    /// Another instance may have refreshed concurrently (refresh-token
+    /// rotation invalidates the old refresh token). Reload the cache and
+    /// adopt newer tokens when they differ from what we hold.
+    fn reloadCacheIfChanged(self: *Bridge) bool {
+        const fresh = (oauth.loadTokenCache(self.alloc, self.cfg.url, self.cacheResource()) catch null) orelse return false;
+        if (self.tokens) |cur| {
+            if (std.mem.eql(u8, fresh.access_token, cur.access_token)) return false;
+        }
+        self.tokens = fresh;
+        if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] adopted tokens refreshed by another instance\n", .{});
+        return true;
+    }
+
     fn ensureAuth(self: *Bridge, www_authenticate: ?[]const u8) !void {
         const alloc = self.alloc;
         const now = std.time.timestamp();
 
         if (!self.tokens_loaded) {
             self.tokens_loaded = true;
-            self.tokens = oauth.loadTokenCache(alloc, self.cfg.url) catch null;
+            self.tokens = oauth.loadTokenCache(alloc, self.cfg.url, self.cacheResource()) catch null;
             if (self.tokens != null and self.cfg.verbose)
                 std.debug.print("mcp-bridge: [oauth] loaded cached tokens\n", .{});
         }
@@ -149,6 +183,7 @@ const Bridge = struct {
             // Expired: refresh once if possible
             if (t.refresh_token) |rt| {
                 if (self.refreshTokens(rt)) |_| return else |err| {
+                    if (self.reloadCacheIfChanged()) return;
                     if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] refresh failed ({s}), full flow\n", .{@errorName(err)});
                 }
             }
@@ -164,7 +199,9 @@ const Bridge = struct {
     fn reauthOn401(self: *Bridge, www_authenticate: ?[]const u8) !void {
         if (self.tokens) |t| {
             if (t.refresh_token) |rt| {
-                if (self.refreshTokens(rt)) |_| return else |_| {}
+                if (self.refreshTokens(rt)) |_| return else |_| {
+                    if (self.reloadCacheIfChanged()) return;
+                }
             }
         }
         try self.fullAuthFlow(www_authenticate);
@@ -173,10 +210,13 @@ const Bridge = struct {
     fn refreshTokens(self: *Bridge, refresh_token: []const u8) !void {
         const disc = try self.discover(null);
         const cfg = self.cfg.oauth orelse OAuthCfg{};
-        const client_id = cfg.client_id orelse return oauth.OAuthError.BadResponse;
-        const t = try oauth.refresh(self.alloc, disc.as.token_endpoint, client_id, cfg.client_secret, refresh_token);
+        const client_id = cfg.client_id orelse
+            (self.tokens orelse return oauth.OAuthError.BadResponse).client_id orelse
+            return oauth.OAuthError.BadResponse;
+        var t = try oauth.refresh(self.alloc, disc.as.token_endpoint, client_id, cfg.client_secret, refresh_token, self.wireResource());
+        t.client_id = try self.alloc.dupe(u8, client_id);
         self.adoptTokens(t);
-        try oauth.saveTokenCache(self.alloc, self.cfg.url, self.tokens.?);
+        try oauth.saveTokenCache(self.alloc, self.cfg.url, self.cacheResource(), self.tokens.?);
         if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] token refreshed\n", .{});
     }
 
@@ -195,12 +235,25 @@ const Bridge = struct {
         const alloc = self.alloc;
         const cfg = self.cfg.oauth orelse OAuthCfg{};
         const disc = try self.discover(www_authenticate);
+        const resource = self.wireResource();
 
-        // Headless: client credentials when a secret is configured
-        if (cfg.client_id != null and cfg.client_secret != null) {
-            const t = try oauth.clientCredentials(alloc, disc.as.token_endpoint, cfg.client_id.?, cfg.client_secret.?, cfg.scope);
+        // Headless: client credentials when forced, or (auto) when a
+        // secret is configured without an explicit grant choice
+        const use_client_credentials = cfg.grant == .client_credentials or
+            (cfg.grant == .auto and cfg.client_id != null and cfg.client_secret != null);
+        if (use_client_credentials) {
+            const cid = cfg.client_id orelse {
+                log.err("--oauth-grant client_credentials requires --oauth-client-id and --oauth-client-secret", .{});
+                return oauth.OAuthError.BadResponse;
+            };
+            const secret = cfg.client_secret orelse {
+                log.err("--oauth-grant client_credentials requires --oauth-client-secret", .{});
+                return oauth.OAuthError.BadResponse;
+            };
+            var t = try oauth.clientCredentials(alloc, disc.as.token_endpoint, cid, secret, cfg.scope, resource);
+            t.client_id = cid;
             self.adoptTokens(t);
-            try oauth.saveTokenCache(alloc, self.cfg.url, self.tokens.?);
+            try oauth.saveTokenCache(alloc, self.cfg.url, self.cacheResource(), self.tokens.?);
             if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] client-credentials token acquired\n", .{});
             return;
         }
@@ -238,7 +291,7 @@ const Bridge = struct {
         const scope = cfg.scope orelse
             if (www_authenticate) |wa| oauth.parseWwwAuthenticateScope(wa) else null;
 
-        const auth_url = try buildAuthUrl(alloc, authz_ep, client_id, redirect_uri, &challenge, &state, scope);
+        const auth_url = try oauth.buildAuthUrl(alloc, authz_ep, client_id, redirect_uri, &challenge, &state, scope, resource);
         defer alloc.free(auth_url);
 
         std.debug.print("mcp-bridge: authorize at:\n{s}\n", .{auth_url});
@@ -256,34 +309,11 @@ const Bridge = struct {
         };
         defer alloc.free(code);
 
-        const t = try oauth.exchangeCode(alloc, disc.as.token_endpoint, client_id, code, redirect_uri, &verifier);
+        var t = try oauth.exchangeCode(alloc, disc.as.token_endpoint, client_id, code, redirect_uri, &verifier, cfg.client_secret, resource);
+        t.client_id = try alloc.dupe(u8, client_id);
         self.adoptTokens(t);
-        try oauth.saveTokenCache(alloc, self.cfg.url, self.tokens.?);
+        try oauth.saveTokenCache(alloc, self.cfg.url, self.cacheResource(), self.tokens.?);
         std.debug.print("mcp-bridge: [oauth] authorization complete, token cached\n", .{});
-    }
-
-    fn buildAuthUrl(
-        alloc: std.mem.Allocator,
-        endpoint: []const u8,
-        client_id: []const u8,
-        redirect_uri: []const u8,
-        challenge: []const u8,
-        state: []const u8,
-        scope: ?[]const u8,
-    ) ![]u8 {
-        var pairs: std.ArrayList([2][]const u8) = .empty;
-        defer pairs.deinit(alloc);
-        try pairs.append(alloc, .{ "response_type", "code" });
-        try pairs.append(alloc, .{ "client_id", client_id });
-        try pairs.append(alloc, .{ "redirect_uri", redirect_uri });
-        try pairs.append(alloc, .{ "state", state });
-        try pairs.append(alloc, .{ "code_challenge", challenge });
-        try pairs.append(alloc, .{ "code_challenge_method", "S256" });
-        if (scope) |s| try pairs.append(alloc, .{ "scope", s });
-        const qs = try oauth.formEncode(alloc, pairs.items);
-        defer alloc.free(qs);
-        const sep: []const u8 = if (std.mem.indexOfScalar(u8, endpoint, '?') != null) "&" else "?";
-        return std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ endpoint, sep, qs });
     }
 
     /// Inject the bearer token header when we hold one. `auth_hdr` is owned
@@ -451,6 +481,8 @@ pub fn main() !void {
     var oauth_client_id: ?[]const u8 = null;
     var oauth_client_secret: ?[]const u8 = null;
     var oauth_scope: ?[]const u8 = null;
+    var oauth_grant: ?[]const u8 = null;
+    var oauth_resource: ?[]const u8 = null;
     var oauth_logout = false;
     var config_path: ?[]const u8 = null;
     var i: usize = 1;
@@ -481,6 +513,18 @@ pub fn main() !void {
             };
         } else if (matchValueFlag(args, &i, "--oauth-scope", null)) |m| {
             oauth_scope = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+        } else if (matchValueFlag(args, &i, "--oauth-grant", null)) |m| {
+            oauth_grant = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+        } else if (matchValueFlag(args, &i, "--resource", null)) |m| {
+            oauth_resource = switch (m) {
                 .missing => usage(),
                 .value => |v| v,
                 .no => unreachable,
@@ -518,8 +562,18 @@ pub fn main() !void {
     var file_sc: ?config_file.ServerConfig = null;
     if (cf) |*c| file_sc = c.lookup(cfg.url);
 
+    const resource: ?[]const u8 = oauth_resource orelse if (file_sc) |sc| sc.resource else null;
+    const grant_str: ?[]const u8 = oauth_grant orelse if (file_sc) |sc| sc.grant else null;
+    const grant: Grant = if (grant_str) |g| blk: {
+        if (std.mem.eql(u8, g, "authorization_code")) break :blk .authorization_code;
+        if (std.mem.eql(u8, g, "client_credentials")) break :blk .client_credentials;
+        if (std.mem.eql(u8, g, "auto")) break :blk .auto;
+        log.err("invalid --oauth-grant '{s}' (expected authorization_code|client_credentials|auto)", .{g});
+        usage();
+    } else .auto;
+
     if (oauth_logout) {
-        try oauth.deleteTokenCache(alloc, cfg.url);
+        try oauth.deleteTokenCache(alloc, cfg.url, resource);
         std.debug.print("mcp-bridge: deleted cached tokens for {s}\n", .{cfg.url});
         return;
     }
@@ -529,6 +583,8 @@ pub fn main() !void {
             .client_id = oauth_client_id orelse if (file_sc) |sc| sc.client_id else null,
             .client_secret = oauth_client_secret orelse if (file_sc) |sc| sc.client_secret else null,
             .scope = oauth_scope orelse if (file_sc) |sc| sc.scope else null,
+            .resource = resource,
+            .grant = grant,
         };
     }
 
@@ -567,7 +623,7 @@ pub fn main() !void {
         if (std.ascii.startsWithIgnoreCase(h, "authorization:")) has_auth_header = true;
     }
     if (!has_auth_header and cfg.target.secure) {
-        bridge.tokens = oauth.loadTokenCache(alloc, cfg.url) catch null;
+        bridge.tokens = oauth.loadTokenCache(alloc, cfg.url, bridge.cacheResource()) catch null;
         bridge.tokens_loaded = true;
         if (bridge.tokens != null and cfg.verbose)
             std.debug.print("mcp-bridge: [oauth] using cached token\n", .{});
