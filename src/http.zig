@@ -8,6 +8,46 @@
 const std = @import("std");
 const mcp = @import("mcp.zig");
 
+pub const Target = struct {
+    secure: bool,
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+
+    /// Origin as "https://host[:port]" (no path), for RFC 9728 discovery.
+    pub fn origin(self: Target, alloc: std.mem.Allocator) ![]u8 {
+        const scheme = if (self.secure) "https" else "http";
+        const default_port: u16 = if (self.secure) 443 else 80;
+        if (self.port == default_port)
+            return std.fmt.allocPrint(alloc, "{s}://{s}", .{ scheme, self.host });
+        return std.fmt.allocPrint(alloc, "{s}://{s}:{d}", .{ scheme, self.host, self.port });
+    }
+};
+
+pub fn parseUrl(url: []const u8) !Target {
+    var rest = url;
+    var secure = true;
+    if (std.mem.startsWith(u8, rest, "https://")) {
+        rest = rest["https://".len..];
+    } else if (std.mem.startsWith(u8, rest, "http://")) {
+        rest = rest["http://".len..];
+        secure = false;
+    } else return error.BadScheme;
+
+    const slash = std.mem.indexOf(u8, rest, "/") orelse rest.len;
+    const authority = rest[0..slash];
+    const path = if (slash < rest.len) rest[slash..] else "/";
+
+    var host = authority;
+    var port: u16 = if (secure) 443 else 80;
+    if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+        host = authority[0..colon];
+        port = std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch return error.BadPort;
+    }
+    if (host.len == 0) return error.BadHost;
+    return .{ .secure = secure, .host = host, .port = port, .path = path };
+}
+
 pub const HttpError = error{
     WriteFailed,
     ReadFailed,
@@ -21,6 +61,7 @@ pub const Response = struct {
     status: u16,
     body: []u8,
     mcp_session_id: ?[]u8, // owned slice into backing
+    www_authenticate: ?[]u8, // owned slice into backing (401 challenges)
     server_closed: bool, // server sent Connection: close
     _backing: []u8, // owns body + session id memory
 
@@ -51,11 +92,27 @@ pub fn post(
     expect_id: ?[]const u8,
     sse_sink: SseSink,
 ) HttpError!Response {
+    return postWith(alloc, tls, host, path, body, "application/json", extra_headers, expect_id, sse_sink);
+}
+
+/// POST with an explicit Content-Type (OAuth form posts use
+/// application/x-www-form-urlencoded).
+pub fn postWith(
+    alloc: std.mem.Allocator,
+    tls: anytype,
+    host: []const u8,
+    path: []const u8,
+    body: []const u8,
+    content_type: []const u8,
+    extra_headers: []const []const u8,
+    expect_id: ?[]const u8,
+    sse_sink: SseSink,
+) HttpError!Response {
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(alloc);
 
     appendFmt(alloc, &req, "POST {s} HTTP/1.1\r\nHost: {s}\r\n", .{ path, host }) catch return HttpError.OutOfMemory;
-    req.appendSlice(alloc, "Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n") catch return HttpError.OutOfMemory;
+    appendFmt(alloc, &req, "Content-Type: {s}\r\nAccept: application/json, text/event-stream\r\n", .{content_type}) catch return HttpError.OutOfMemory;
     for (extra_headers) |h| {
         appendFmt(alloc, &req, "{s}\r\n", .{h}) catch return HttpError.OutOfMemory;
     }
@@ -65,6 +122,29 @@ pub fn post(
     tls.writeAll(req.items) catch return HttpError.WriteFailed;
 
     return readResponse(alloc, tls, expect_id, sse_sink);
+}
+
+/// GET `path` on an established TLS stream (OAuth discovery metadata).
+pub fn get(
+    alloc: std.mem.Allocator,
+    tls: anytype,
+    host: []const u8,
+    path: []const u8,
+    extra_headers: []const []const u8,
+) HttpError!Response {
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(alloc);
+
+    appendFmt(alloc, &req, "GET {s} HTTP/1.1\r\nHost: {s}\r\n", .{ path, host }) catch return HttpError.OutOfMemory;
+    req.appendSlice(alloc, "Accept: application/json\r\n") catch return HttpError.OutOfMemory;
+    for (extra_headers) |h| {
+        appendFmt(alloc, &req, "{s}\r\n", .{h}) catch return HttpError.OutOfMemory;
+    }
+    req.appendSlice(alloc, "\r\n") catch return HttpError.OutOfMemory;
+
+    tls.writeAll(req.items) catch return HttpError.WriteFailed;
+
+    return readResponse(alloc, tls, null, .{});
 }
 
 /// DELETE for session termination.
@@ -234,6 +314,7 @@ fn readResponse(
     // Headers of interest
     const content_length = getHeaderNumeric(head, "content-length");
     const session_id = getHeaderValue(head, "mcp-session-id");
+    const www_authenticate = getHeaderValue(head, "www-authenticate");
     const conn_hdr = getHeaderValue(head, "connection");
     const server_closed = if (conn_hdr) |v| std.ascii.eqlIgnoreCase(v, "close") else false;
     const chunked = if (getHeaderValue(head, "transfer-encoding")) |v|
@@ -298,20 +379,26 @@ fn readResponse(
         alloc.free(m);
     }
 
-    // Move body (+ optional session id) into one owned allocation
+    // Move body (+ optional session id / challenge) into one owned allocation
     const body_len = body.items.len;
     const sid_len: usize = if (session_id) |s| s.len else 0;
+    const wa_len: usize = if (www_authenticate) |s| s.len else 0;
 
-    const backing = alloc.alloc(u8, body_len + sid_len) catch return HttpError.OutOfMemory;
+    const backing = alloc.alloc(u8, body_len + sid_len + wa_len) catch return HttpError.OutOfMemory;
     @memcpy(backing[0..body_len], body.items);
     var sid: ?[]u8 = null;
     if (session_id) |s| {
         @memcpy(backing[body_len..][0..sid_len], s);
         sid = backing[body_len..][0..sid_len];
     }
+    var wa: ?[]u8 = null;
+    if (www_authenticate) |s| {
+        @memcpy(backing[body_len + sid_len ..][0..wa_len], s);
+        wa = backing[body_len + sid_len ..][0..wa_len];
+    }
     buf.deinit(alloc);
 
-    return .{ .status = status, .body = backing[0..body_len], .mcp_session_id = sid, .server_closed = server_closed or is_sse, ._backing = backing };
+    return .{ .status = status, .body = backing[0..body_len], .mcp_session_id = sid, .www_authenticate = wa, .server_closed = server_closed or is_sse, ._backing = backing };
 }
 
 fn getHeaderValue(head: []const u8, name: []const u8) ?[]const u8 {

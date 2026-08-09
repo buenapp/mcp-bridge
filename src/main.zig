@@ -20,12 +20,7 @@ const mcp = @import("mcp.zig");
 
 const log = std.log.scoped(.bridge);
 
-const Target = struct {
-    secure: bool,
-    host: []const u8,
-    port: u16,
-    path: []const u8,
-};
+const Target = http.Target;
 
 const Config = struct {
     target: Target,
@@ -46,27 +41,7 @@ fn usage() noreturn {
 }
 
 fn parseUrl(url: []const u8) !Target {
-    var rest = url;
-    var secure = true;
-    if (std.mem.startsWith(u8, rest, "https://")) {
-        rest = rest["https://".len..];
-    } else if (std.mem.startsWith(u8, rest, "http://")) {
-        rest = rest["http://".len..];
-        secure = false;
-    } else return error.BadScheme;
-
-    const slash = std.mem.indexOf(u8, rest, "/") orelse rest.len;
-    const authority = rest[0..slash];
-    const path = if (slash < rest.len) rest[slash..] else "/";
-
-    var host = authority;
-    var port: u16 = if (secure) 443 else 80;
-    if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
-        host = authority[0..colon];
-        port = std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch return error.BadPort;
-    }
-    if (host.len == 0) return error.BadHost;
-    return .{ .secure = secure, .host = host, .port = port, .path = path };
+    return http.parseUrl(url);
 }
 
 fn readLineFromStdin(alloc: std.mem.Allocator, carry: *std.ArrayList(u8)) !?[]u8 {

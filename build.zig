@@ -1,13 +1,24 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{
+    var target = b.standardTargetOptions(.{
         .default_target = .{
             .cpu_arch = .x86_64,
             .os_tag = .windows,
             .abi = .gnu,
         },
     });
+
+    // Pin glibc >= 2.39 for Linux cross builds: the sysroot OpenSSL
+    // (Ubuntu 24.04) references versioned symbols (e.g. stat@GLIBC_2.33,
+    // __isoc23_strtol@GLIBC_2.38) that zig's older default baseline lacks.
+    if (target.result.os.tag == .linux and target.result.abi == .gnu and
+        target.query.glibc_version == null)
+    {
+        var q = target.query;
+        q.glibc_version = .{ .major = 2, .minor = 39, .patch = 0 };
+        target = b.resolveTargetQuery(q);
+    }
 
     const optimize = b.standardOptimizeOption(.{});
 
@@ -72,7 +83,9 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Host-side unit tests for the platform-independent modules.
+    // Host-side unit tests (dane matcher, mcp, pkce, oauth, config).
+    // oauth.zig reaches the platform TLS layer, so the host test binary
+    // needs the same link setup as the executable.
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_main.zig"),
@@ -80,6 +93,24 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    if (b.graph.host.result.os.tag == .windows) {
+        tests.root_module.linkSystemLibrary("ws2_32", .{});
+        tests.root_module.linkSystemLibrary("secur32", .{});
+        tests.root_module.linkSystemLibrary("crypt32", .{});
+        tests.root_module.linkSystemLibrary("dnsapi", .{});
+        tests.root_module.linkSystemLibrary("kernel32", .{});
+    } else {
+        tests.root_module.link_libc = true;
+        if (b.graph.host.result.os.tag == .freebsd) {
+            tests.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+            tests.root_module.addObjectFile(.{ .cwd_relative = "/usr/lib/libssl.so" });
+            tests.root_module.addObjectFile(.{ .cwd_relative = "/usr/lib/libcrypto.so" });
+        } else if (b.graph.host.result.os.tag == .linux) {
+            tests.root_module.linkSystemLibrary("ssl", .{});
+            tests.root_module.linkSystemLibrary("crypto", .{});
+            tests.root_module.linkSystemLibrary("resolv", .{});
+        }
+    }
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests (host)");
     test_step.dependOn(&run_tests.step);
