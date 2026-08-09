@@ -413,6 +413,32 @@ const Bridge = struct {
     }
 };
 
+/// A value-taking CLI flag matched in any of these forms:
+///   --name value        (two argv entries)
+///   --name=value
+///   --name "value"      (single argv entry — GUI MCP clients glue these)
+///   -h value            (optional short form)
+/// Returns .no if the current arg is not this flag, .missing if the value
+/// is absent, else .value.
+const FlagMatch = union(enum) { no, missing, value: []const u8 };
+
+fn matchValueFlag(args: []const []const u8, i: *usize, long: []const u8, short: ?[]const u8) ?FlagMatch {
+    const a = args[i.*];
+    if (std.mem.eql(u8, a, long) or (short != null and std.mem.eql(u8, a, short.?))) {
+        if (i.* + 1 >= args.len) return .missing;
+        i.* += 1;
+        return .{ .value = args[i.*] };
+    }
+    if (std.mem.startsWith(u8, a, long) and a.len > long.len and
+        (a[long.len] == '=' or a[long.len] == ' '))
+    {
+        const v = std.mem.trim(u8, a[long.len + 1 ..], " \t\"'");
+        if (v.len == 0) return .missing;
+        return .{ .value = v };
+    }
+    return null;
+}
+
 pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa_state.allocator();
@@ -432,30 +458,41 @@ pub fn main() !void {
         const a = args[i];
         if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
             cfg.verbose = true;
-        } else if (std.mem.eql(u8, a, "--header") or std.mem.eql(u8, a, "-H")) {
-            i += 1;
-            if (i >= args.len) usage();
-            try cfg.headers.append(alloc, args[i]);
+        } else if (matchValueFlag(args, &i, "--header", "-H")) |m| {
+            const v = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+            try cfg.headers.append(alloc, v);
         } else if (std.mem.eql(u8, a, "--oauth")) {
             oauth_flag = true;
-        } else if (std.mem.eql(u8, a, "--oauth-client-id")) {
-            i += 1;
-            if (i >= args.len) usage();
-            oauth_client_id = args[i];
-        } else if (std.mem.eql(u8, a, "--oauth-client-secret")) {
-            i += 1;
-            if (i >= args.len) usage();
-            oauth_client_secret = args[i];
-        } else if (std.mem.eql(u8, a, "--oauth-scope")) {
-            i += 1;
-            if (i >= args.len) usage();
-            oauth_scope = args[i];
+        } else if (matchValueFlag(args, &i, "--oauth-client-id", null)) |m| {
+            oauth_client_id = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+        } else if (matchValueFlag(args, &i, "--oauth-client-secret", null)) |m| {
+            oauth_client_secret = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+        } else if (matchValueFlag(args, &i, "--oauth-scope", null)) |m| {
+            oauth_scope = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
         } else if (std.mem.eql(u8, a, "--oauth-logout")) {
             oauth_logout = true;
-        } else if (std.mem.eql(u8, a, "--config")) {
-            i += 1;
-            if (i >= args.len) usage();
-            config_path = args[i];
+        } else if (matchValueFlag(args, &i, "--config", null)) |m| {
+            config_path = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
         } else if (url == null) {
             url = a;
         } else {
