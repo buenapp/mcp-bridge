@@ -9,11 +9,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Pin glibc >= 2.39 for Linux cross builds: the sysroot OpenSSL
+    // Pin glibc >= 2.39 for Linux CROSS builds only: the sysroot OpenSSL
     // (Ubuntu 24.04) references versioned symbols (e.g. stat@GLIBC_2.33,
     // __isoc23_strtol@GLIBC_2.38) that zig's older default baseline lacks.
-    if (target.result.os.tag == .linux and target.result.abi == .gnu and
-        target.query.glibc_version == null)
+    // Native Linux builds use the system toolchain and must NOT be pinned
+    // (a 2.39-pinned binary can't run on older-glibc build hosts).
+    if (!target.query.isNative() and target.result.os.tag == .linux and
+        target.result.abi == .gnu and target.query.glibc_version == null)
     {
         var q = target.query;
         q.glibc_version = .{ .major = 2, .minor = 39, .patch = 0 };

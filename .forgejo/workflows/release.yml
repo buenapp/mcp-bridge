@@ -275,24 +275,32 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build-and-release
     steps:
+      # act containers (node:*-bookworm) lack ca-certificates — git over
+      # HTTPS fails without it, so this must precede actions/checkout.
+      - name: Bootstrap CA certificates
+        run: |
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq ca-certificates curl xz-utils
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install zig 0.15.2 + build tools
         run: |
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
           curl -fsSLo /tmp/zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
           echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz" | sha256sum -c -
-          sudo tar -xf /tmp/zig.tar.xz -C /opt
-          sudo ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libssl-dev rpm
+          $SUDO tar -xf /tmp/zig.tar.xz -C /opt
+          $SUDO ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+          $SUDO apt-get install -y -qq libssl-dev rpm dpkg
           zig version
 
       - name: Unit tests
         run: zig build test
 
       - name: Build (ReleaseSafe, native)
-        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+        run: zig build -Dtarget=native -Doptimize=ReleaseSafe
 
       - name: Smoke test (DANE + PKI fallback)
         run: |
@@ -314,7 +322,7 @@ jobs:
             echo "Version: $VERSION"
             echo "Architecture: amd64"
             echo "Maintainer: Daniel Morante <daniel@morante.net>"
-            echo "Depends: libssl3t64"
+            echo "Depends: libssl3t64 | libssl3"
             echo "Homepage: https://pacyworld.dev/buenapp/mcp-bridge"
             echo "Description: MCP stdio to HTTP(S) bridge with DANE TLSA verification"
             echo " Connects stdio-only MCP clients to remote MCP servers over HTTP(S)"
@@ -358,12 +366,13 @@ jobs:
 
       - name: Verify packages install (smoke)
         run: |
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
           TAG="${GITHUB_REF_NAME:-dev}"
           VERSION="${TAG#v}"
-          sudo dpkg -i "mcp-bridge_${VERSION}_amd64.deb"
+          $SUDO dpkg -i "mcp-bridge_${VERSION}_amd64.deb"
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
             | /usr/bin/mcp-bridge https://memory.morante.com/mcp --verbose 2>&1 | grep -q "DANE result: success"
-          sudo dpkg -r mcp-bridge
+          $SUDO dpkg -r mcp-bridge
 
       - name: Upload Linux packages to release
         if: startsWith(github.ref, 'refs/tags/v')

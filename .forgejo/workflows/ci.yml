@@ -39,25 +39,32 @@ jobs:
   build-linux:
     runs-on: ubuntu-24.04
     steps:
+      # act containers (node:*-bookworm) lack ca-certificates — git over
+      # HTTPS fails without it, so this must precede actions/checkout.
+      - name: Bootstrap CA certificates
+        run: |
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq ca-certificates curl xz-utils
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install zig 0.15.2
+      - name: Install zig 0.15.2 + OpenSSL headers
         run: |
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
           curl -fsSLo /tmp/zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
           echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz" | sha256sum -c -
-          sudo tar -xf /tmp/zig.tar.xz -C /opt
-          sudo ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+          $SUDO tar -xf /tmp/zig.tar.xz -C /opt
+          $SUDO ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+          $SUDO apt-get install -y -qq libssl-dev
           zig version
-
-      - name: Install OpenSSL headers
-        run: sudo apt-get install -y -qq libssl-dev
 
       - name: Unit tests
         run: zig build test
 
       - name: Build (ReleaseSafe, native)
-        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+        run: zig build -Dtarget=native -Doptimize=ReleaseSafe
 
       - name: Smoke test (DANE + PKI fallback)
         run: |
