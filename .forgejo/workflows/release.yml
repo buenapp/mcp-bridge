@@ -138,6 +138,33 @@ jobs:
           cp dist-linux/bin/mcp-bridge "$JPATH/tmp/"
           doas jexec "$LINUX_JAIL" /tmp/mcp-bridge 2>&1 | head -2 || true
 
+      # --- FreeBSD .pkg (hand-rolled manifest; poudriere builds the ports-
+      # tree package separately) ---
+      - name: Build FreeBSD package (.pkg)
+        run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          VERSION="${TAG#v}"
+          STAGE=$(mktemp -d /tmp/mcp-bridge-pkg.XXXXXX)
+          mkdir -p "$STAGE/usr/local/bin"
+          cp dist-freebsd/bin/mcp-bridge "$STAGE/usr/local/bin/mcp-bridge"
+          chmod 555 "$STAGE/usr/local/bin/mcp-bridge"
+          {
+            echo "name: mcp-bridge"
+            echo "version: $VERSION"
+            echo "origin: net/mcp-bridge"
+            echo "comment: MCP stdio to HTTP(S) bridge with DANE TLSA verification"
+            echo "maintainer: daniel@morante.net"
+            echo "www: https://pacyworld.dev/buenapp/mcp-bridge"
+            echo "abi: FreeBSD:15:amd64"
+            echo "prefix: /usr/local"
+            echo "desc: MCP stdio bridge: connects stdio-only MCP clients to remote MCP servers over HTTP(S) Streamable HTTP transport with DANE TLSA verification and OAuth 2.1 support."
+          } > "$STAGE/+MANIFEST"
+          echo "bin/mcp-bridge" > "$STAGE/plist"
+          mkdir -p dist-pkg
+          pkg create -m "$STAGE" -p "$STAGE/plist" -r "$STAGE" -o dist-pkg
+          ls -l dist-pkg/
+          rm -rf "$STAGE"
+
       - name: Tear down Linux jail
         if: always()
         run: |
@@ -232,3 +259,136 @@ jobs:
             --data-binary @dist-linux/bin/mcp-bridge \
             "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-x86_64-linux"
           echo "Uploaded Linux binary"
+
+          # Upload FreeBSD package
+          PKGF=$(ls dist-pkg/mcp-bridge-*.pkg | head -1)
+          curl -s -X POST -H "$AUTH" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@$PKGF" \
+            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-x86_64-freebsd.pkg"
+          echo "Uploaded FreeBSD package"
+
+  # --- Native Linux build + .deb + .rpm on the Ubuntu runner ---
+  # (zig deadlocks under the FreeBSD Linuxulator, so Linux builds run
+  # natively here instead of in the jail.)
+  linux-packages:
+    runs-on: ubuntu-24.04
+    needs: build-and-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install zig 0.15.2 + build tools
+        run: |
+          curl -fsSLo /tmp/zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+          echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo tar -xf /tmp/zig.tar.xz -C /opt
+          sudo ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev rpm
+          zig version
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Build (ReleaseSafe, native)
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+
+      - name: Smoke test (DANE + PKI fallback)
+        run: |
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | ./zig-out/bin/mcp-bridge https://memory.morante.com/mcp --verbose 2>&1 | grep -q "DANE result: success"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | ./zig-out/bin/mcp-bridge https://github.com/mcp --verbose 2>&1 | grep -q "certificate accepted"
+
+      - name: Build .deb package
+        run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          VERSION="${TAG#v}"
+          STAGE=$(mktemp -d)
+          mkdir -p "$STAGE/pkg/DEBIAN" "$STAGE/pkg/usr/bin"
+          cp zig-out/bin/mcp-bridge "$STAGE/pkg/usr/bin/mcp-bridge"
+          chmod 755 "$STAGE/pkg/usr/bin/mcp-bridge"
+          {
+            echo "Package: mcp-bridge"
+            echo "Version: $VERSION"
+            echo "Architecture: amd64"
+            echo "Maintainer: Daniel Morante <daniel@morante.net>"
+            echo "Depends: libssl3t64"
+            echo "Homepage: https://pacyworld.dev/buenapp/mcp-bridge"
+            echo "Description: MCP stdio to HTTP(S) bridge with DANE TLSA verification"
+            echo " Connects stdio-only MCP clients to remote MCP servers over HTTP(S)"
+            echo " Streamable HTTP transport with DANE TLSA verification and OAuth 2.1."
+          } > "$STAGE/pkg/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "$STAGE/pkg" "mcp-bridge_${VERSION}_amd64.deb"
+          dpkg-deb --info "mcp-bridge_${VERSION}_amd64.deb"
+          rm -rf "$STAGE"
+
+      - name: Build .rpm package
+        run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          VERSION="${TAG#v}"
+          STAGE=$(mktemp -d)
+          mkdir -p "$STAGE/BUILD" "$STAGE/RPMS" "$STAGE/SOURCES" "$STAGE/SPECS" "$STAGE/BUILDROOT/pkg/usr/bin"
+          cp zig-out/bin/mcp-bridge "$STAGE/BUILDROOT/pkg/usr/bin/mcp-bridge"
+          chmod 755 "$STAGE/BUILDROOT/pkg/usr/bin/mcp-bridge"
+          {
+            echo "Name: mcp-bridge"
+            echo "Version: $VERSION"
+            echo "Release: 1%{?dist}"
+            echo "Summary: MCP stdio to HTTP(S) bridge with DANE TLSA verification"
+            echo "License: BSD-2-Clause"
+            echo "URL: https://pacyworld.dev/buenapp/mcp-bridge"
+            echo "Requires: openssl-libs"
+            echo ""
+            echo "%description"
+            echo "Connects stdio-only MCP clients to remote MCP servers over HTTP(S)"
+            echo "Streamable HTTP transport with DANE TLSA verification and OAuth 2.1."
+            echo ""
+            echo "%install"
+            echo "mkdir -p %{buildroot}/usr/bin"
+            echo "install -m 755 $STAGE/BUILDROOT/pkg/usr/bin/mcp-bridge %{buildroot}/usr/bin/mcp-bridge"
+            echo ""
+            echo "%files"
+            echo "/usr/bin/mcp-bridge"
+          } > "$STAGE/SPECS/mcp-bridge.spec"
+          rpmbuild --define "_topdir $STAGE" -bb "$STAGE/SPECS/mcp-bridge.spec"
+          find "$STAGE/RPMS" -name "*.rpm" -exec cp {} . \;
+          rm -rf "$STAGE"
+
+      - name: Verify packages install (smoke)
+        run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          VERSION="${TAG#v}"
+          sudo dpkg -i "mcp-bridge_${VERSION}_amd64.deb"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | /usr/bin/mcp-bridge https://memory.morante.com/mcp --verbose 2>&1 | grep -q "DANE result: success"
+          sudo dpkg -r mcp-bridge
+
+      - name: Upload Linux packages to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          REPO="$GITHUB_REPOSITORY"
+          BASE_URL="$GITHUB_SERVER_URL/api/v1/repos/$REPO"
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${TAG#v}"
+          AUTH="Authorization: token $FORGEJO_TOKEN"
+
+          RESP=$(curl -s -H "$AUTH" "$BASE_URL/releases/tags/$TAG")
+          RELEASE_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*' || true)
+          if [ -z "$RELEASE_ID" ]; then
+            echo "ERROR: release for $TAG not found"
+            exit 1
+          fi
+
+          RPMF=$(ls mcp-bridge-${VERSION}-*.rpm | head -1)
+          for f in "mcp-bridge_${VERSION}_amd64.deb" "$RPMF"; do
+            curl -s -X POST -H "$AUTH" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$f" \
+              "$BASE_URL/releases/$RELEASE_ID/assets?name=$f"
+            echo "Uploaded $f"
+          done

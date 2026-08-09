@@ -33,3 +33,35 @@ jobs:
           zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseSafe --prefix /tmp/mcp-bridge-fbsd
           file /tmp/mcp-bridge-fbsd/bin/mcp-bridge
           readelf -d /tmp/mcp-bridge-fbsd/bin/mcp-bridge | grep NEEDED
+
+  # Native Linux build + tests on the Ubuntu runner (avoids the
+  # Linuxulator: zig deadlocks there on this project's builds).
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install zig 0.15.2
+        run: |
+          curl -fsSLo /tmp/zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+          echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo tar -xf /tmp/zig.tar.xz -C /opt
+          sudo ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+          zig version
+
+      - name: Install OpenSSL headers
+        run: sudo apt-get install -y -qq libssl-dev
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Build (ReleaseSafe, native)
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+
+      - name: Smoke test (DANE + PKI fallback)
+        run: |
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | ./zig-out/bin/mcp-bridge https://memory.morante.com/mcp --verbose 2>&1 | grep -q "DANE result: success"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | ./zig-out/bin/mcp-bridge https://github.com/mcp --verbose 2>&1 | grep -q "certificate accepted"
