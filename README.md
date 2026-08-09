@@ -15,18 +15,83 @@ the system trust store (Windows root store / certctl / distro bundle).
 Servers that require authorization (HTTP 401) are handled with built-in
 **OAuth 2.1** — no `mcp-remote` shim needed.
 
+## Installation
+
+Pre-built binaries and packages are on the
+[releases page](https://pacyworld.dev/buenapp/mcp-bridge/releases)
+([GitHub mirror](https://github.com/buenapp/mcp-bridge/releases)).
+`<ver>` below is the release version without the `v` prefix (e.g. `0.2.2`).
+
+### Windows
+
+Download and run the installer:
+
+- `mcp-bridge-<ver>-setup.exe` — per-user installer (no admin required,
+  Authenticode-signed). Installs `mcp-bridge.exe` into
+  `%LOCALAPPDATA%\Programs\MCP Bridge` and adds that directory to the user
+  `PATH`. **Restart your MCP client** after installing so it picks up the
+  new `PATH`.
+- `mcp-bridge-<ver>.exe` — standalone binary (also signed) if you prefer
+  to place it somewhere yourself.
+
+### FreeBSD
+
+System-wide, via pkg:
+
+```sh
+pkg install mcp-bridge                              # PortsPlus repo
+# or, from a downloaded release asset:
+doas pkg add mcp-bridge-<ver>-x86_64-freebsd.pkg
+```
+
+Both install `/usr/local/bin/mcp-bridge`.
+
+User-local install (no root): download `mcp-bridge-<ver>-x86_64-freebsd`
+and drop it in `$HOME/bin` — on FreeBSD that directory is in the default
+login `PATH`:
+
+```sh
+mkdir -p ~/bin
+fetch -o ~/bin/mcp-bridge \
+  https://pacyworld.dev/buenapp/mcp-bridge/releases/download/v<ver>/mcp-bridge-<ver>-x86_64-freebsd
+chmod +x ~/bin/mcp-bridge
+```
+
+### Linux
+
+System-wide, via the package manager:
+
+```sh
+# Debian / Ubuntu
+sudo dpkg -i mcp-bridge_<ver>_amd64.deb        # or: sudo apt install ./mcp-bridge_<ver>_amd64.deb
+
+# Fedora / RHEL
+sudo dnf install ./mcp-bridge-<ver>-1.*.rpm
+```
+
+Both install `/usr/bin/mcp-bridge` and pull in the distro OpenSSL 3
+dependency automatically.
+
+User-local install: download `mcp-bridge-<ver>-x86_64-linux` and place it
+in `$HOME/.local/bin` (Fedora/Ubuntu default) or `$HOME/bin`:
+
+```sh
+mkdir -p ~/.local/bin
+curl -L -o ~/.local/bin/mcp-bridge \
+  https://pacyworld.dev/buenapp/mcp-bridge/releases/download/v<ver>/mcp-bridge-<ver>-x86_64-linux
+chmod +x ~/.local/bin/mcp-bridge
+```
+
+Note: on Linux these directories are only added to `PATH` at login time
+**if they already exist**, so if the directory is new you must log out and
+back in once before `mcp-bridge` resolves by name. You can verify with
+`command -v mcp-bridge`.
+
 ## Usage
 
 ```
 mcp-bridge <url> [--header "Name: Value"]... [--verbose]
 ```
-
-The Windows installer puts `mcp-bridge.exe` in
-`%LOCALAPPDATA%\Programs\MCP Bridge` and adds that directory to the user
-`PATH`, so clients can invoke it by name (restart the client after
-installing so it picks up the new `PATH`). On FreeBSD,
-`pkg install mcp-bridge` (pacyworld repo) or copy the release binary into
-`~/.local/bin` or `/usr/local/bin`.
 
 Example `mcp_config.json` entry:
 
@@ -103,9 +168,25 @@ then open the URL manually.
 --oauth-client-id ID        pre-registered client id (else DCR)
 --oauth-client-secret SEC   client secret (enables headless client-credentials)
 --oauth-scope SCOPES        scopes to request (else the server's 401 scope)
+--oauth-grant GRANT         authorization_code | client_credentials (default: auto)
+--resource URI              RFC 8707 resource indicator (default: the server URL)
 --config PATH               JSON config file
 --oauth-logout              delete cached tokens for <url> and exit
 ```
+
+**Grant selection.** With `--oauth-grant authorization_code`, a configured
+client id + secret runs the interactive authorization-code flow as a
+**confidential client** (the secret is sent at the token endpoint) instead
+of the headless client-credentials grant. `auto` (the default) keeps the
+historic behavior: id + secret → client-credentials, anything else →
+authorization code + PKCE.
+
+**Resource indicator.** The bridge sends an RFC 8707 `resource` parameter
+on the authorization and token requests; it defaults to the server URL.
+Set `--resource` when a multi-tenant server needs a distinct resource URI
+per tenant — each explicit resource also gets its own entry in the token
+cache, so the same server URL can serve multiple tenants without their
+sessions overwriting each other.
 
 Optional config file (`~/.config/mcp-bridge/config.json` on POSIX,
 `%APPDATA%\mcp-bridge\config.json` on Windows), keyed by server URL;
@@ -117,7 +198,9 @@ flags override file values:
     "https://mcp.example.com/mcp": {
       "oauth": true,
       "client_id": "my-client",
-      "scope": "openid profile"
+      "scope": "openid profile",
+      "resource": "https://tenant1.example.net/",
+      "grant": "authorization_code"
     }
   }
 }
