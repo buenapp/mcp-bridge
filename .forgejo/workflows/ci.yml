@@ -36,8 +36,6 @@ jobs:
 
   # Native Linux build + tests on the Ubuntu runner (avoids the
   # Linuxulator: zig deadlocks there on this project's builds).
-  # node:24-trixie (glibc 2.41) so the glibc-2.39-pinned binary can run
-  # for the smoke test; the act default (bookworm, glibc 2.36) is too old.
   build-linux:
     runs-on: ubuntu-24.04
     container: node:24-trixie
@@ -106,17 +104,19 @@ jobs:
       - name: Unit tests
         run: zig build test
 
-      - name: Build (ReleaseSafe)
-        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+      - name: Build (ReleaseSafe, native)
+        run: zig build -Dtarget=native -Doptimize=ReleaseSafe
 
-      # PKI positive against a public host, fail-closed against a local
-      # self-signed server. DANE-positive E2E needs a TLSA-publishing host
-      # and stays a manual/internal test (memory.morante.com is internal
-      # and production — do NOT use it in CI).
-      - name: Smoke test (PKI fallback + fail-closed)
+      # DANE positive via the long-standing public DANE test host
+      # (www.huque.com publishes TLSA on 443), PKI positive via github.com,
+      # fail-closed against a local self-signed server. Do NOT add internal
+      # production hosts here — CI runners are outside the internal network.
+      - name: Smoke test (DANE + PKI fallback + fail-closed)
         run: |
           SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
           $SUDO apt-get install -y -qq openssl
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | ./zig-out/bin/mcp-bridge https://www.huque.com/ --verbose 2>&1 | grep -q "DANE result: success"
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
             | ./zig-out/bin/mcp-bridge https://github.com/mcp --verbose 2>&1 | grep -q "certificate accepted"
           openssl req -x509 -newkey rsa:2048 -keyout /tmp/ssk.pem -out /tmp/ssc.pem -days 1 -nodes -subj "/CN=localhost" 2>/dev/null
