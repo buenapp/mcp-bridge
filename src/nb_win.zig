@@ -29,12 +29,6 @@ pub const Fd = win.SOCKET;
 const ws2 = win.ws2;
 const kernel32 = windows.kernel32;
 
-pub var debug_probe: bool = false;
-
-fn dbg(comptime fmt: []const u8, args: anytype) void {
-    if (debug_probe) std.debug.print(fmt, args);
-}
-
 /// Same outcome shapes as the POSIX nb layer.
 pub const NbRead = union(enum) {
     data: usize,
@@ -198,8 +192,7 @@ pub const PlainNb = struct {
     }
 
     fn postConnectSetup(self: *PlainNb) void {
-        const rc = ws2.setsockopt(self.sock, win.SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, null, 0);
-        dbg("nbwin: SO_UPDATE_CONNECT_CONTEXT rc={d} err={d}\n", .{ rc, @intFromEnum(ws2.WSAGetLastError()) });
+        _ = ws2.setsockopt(self.sock, win.SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, null, 0);
     }
 
     /// Confirm the connect after its completion (or inline completion).
@@ -257,7 +250,6 @@ pub const PlainNb = struct {
         var buf = ws2.WSABUF{ .len = self.recv_buf.len, .buf = &self.recv_buf };
         var flags: u32 = 0;
         const rc = ws2.WSARecv(self.sock, @ptrCast(&buf), 1, null, &flags, &self.recv_ov, null);
-        dbg("nbwin: WSARecv post rc={d} err={d}\n", .{ rc, @intFromEnum(ws2.WSAGetLastError()) });
         if (rc == 0 or ws2.WSAGetLastError() == .WSA_IO_PENDING) {
             self.recv_pending = true;
             return .want_read;
