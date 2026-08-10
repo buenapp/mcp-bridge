@@ -97,7 +97,7 @@ pub fn request(
     var req = try httpc.buildRequest(alloc, method, target.path, target.host, accept, content_type, extra_headers, body);
     errdefer req.deinit(alloc);
 
-    const conn = try httpc.Conn.startPost(alloc, &evp, &handler, target, req, null, null, verifier);
+    const conn = try httpc.Conn.startPost(alloc, &evp, handler, target, req, null, null, verifier);
     // No conn registry here: this private loop reaps directly once done.
 
     var events: [16]evport.Event = undefined;

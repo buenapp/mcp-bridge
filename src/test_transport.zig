@@ -1,6 +1,11 @@
-// Integration tests: legacy HTTP+SSE transport (2024-11-05), http-first
-// auto-fallback, and the Streamable HTTP standalone GET push stream —
-// against in-process mock servers (plain HTTP on 127.0.0.1).
+// Integration tests on the event core (issue #7): legacy HTTP+SSE
+// transport (2024-11-05), http-first auto-fallback, the Streamable HTTP
+// standalone GET push stream, and Last-Event-ID resume — against
+// in-process mock servers (plain HTTP on 127.0.0.1; the server side runs
+// on a thread and may block, the bridge under test never does).
+//
+// Tests drive the loop explicitly: injectLine() feeds stdin lines and
+// waitFor()/stepUntil() pump the event port.
 
 const std = @import("std");
 const main_mod = @import("main.zig");
@@ -13,46 +18,51 @@ const Out = main_mod.Out;
 
 // ------------------------------------------------------- collector sink ----
 
-/// Captures bridge output (an Out sink) for assertions.
+/// Captures bridge output (an Out sink) for assertions. Single-threaded:
+/// the bridge's loop runs on the test thread via step().
 const Collector = struct {
     alloc: std.mem.Allocator,
-    /// Handed to the Out sink; held while writeFn runs.
-    out_mutex: std.Thread.Mutex = .{},
-    /// Protects buf for waitFor (lock order: out_mutex -> mutex).
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
     buf: std.ArrayList(u8) = .empty,
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) void {
         const self: *Collector = @ptrCast(@alignCast(ctx));
-        self.mutex.lock();
-        defer self.mutex.unlock();
         self.buf.appendSlice(self.alloc, bytes) catch {};
-        self.cond.broadcast();
     }
 
     fn out(self: *Collector) Out {
-        return .{ .ctx = self, .mutex = &self.out_mutex, .writeFn = writeFn };
+        return .{ .ctx = self, .writeFn = writeFn };
     }
 
     fn deinit(self: *Collector) void {
         self.buf.deinit(self.alloc);
     }
 
-    /// Wait until the captured output contains `needle` (or timeout).
-    fn waitFor(self: *Collector, needle: []const u8, timeout_ns: u64) bool {
-        var waited: u64 = 0;
-        const step: u64 = 10 * std.time.ns_per_ms;
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        while (std.mem.indexOf(u8, self.buf.items, needle) == null) {
-            if (waited >= timeout_ns) return false;
-            _ = self.cond.timedWait(&self.mutex, step) catch {};
-            waited += step;
-        }
-        return true;
+    fn contains(self: *Collector, needle: []const u8) bool {
+        return std.mem.indexOf(u8, self.buf.items, needle) != null;
     }
 };
+
+/// Step the loop until the collector contains `needle` (bounded ~5s).
+fn waitFor(bridge: *Bridge, collector: *Collector, needle: []const u8) bool {
+    var rounds: usize = 0;
+    while (!collector.contains(needle)) {
+        if (rounds > 500) return false;
+        bridge.step(10) catch return false;
+        rounds += 1;
+    }
+    return true;
+}
+
+/// Step the loop until `cond` holds (bounded ~5s).
+fn stepUntil(bridge: *Bridge, cond: *const fn (b: *Bridge) bool) bool {
+    var rounds: usize = 0;
+    while (!cond(bridge)) {
+        if (rounds > 500) return false;
+        bridge.step(10) catch return false;
+        rounds += 1;
+    }
+    return true;
+}
 
 // ------------------------------------------------------------ mock HTTP ----
 
@@ -118,7 +128,7 @@ fn writeAll(stream: *std.net.Stream, bytes: []const u8) !void {
     while (off < bytes.len) off += try stream.write(bytes[off..]);
 }
 
-/// Drain a connection until the peer closes (pump teardown).
+/// Drain a connection until the peer closes (stream teardown).
 fn drainUntilClose(stream: *std.net.Stream) void {
     var tmp: [4096]u8 = undefined;
     while (true) {
@@ -134,6 +144,8 @@ const Mock = struct {
     /// Set by handlers for test assertions (written before the event the
     /// test waits on, so no extra synchronization is needed).
     last_event_id_seen: bool = false,
+    /// Sampling test: the client's answer POST arrived while stream 1 open.
+    answer_seen: bool = false,
 
     fn start(alloc: std.mem.Allocator) !Mock {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);
@@ -203,27 +215,22 @@ test "legacy SSE: endpoint discovery, async response, server push" {
     const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/sse", .{mock.port()});
     defer alloc.free(url);
     var cfg = Config{ .target = try http.parseUrl(url), .url = url, .transport = .sse_only };
-    var bridge = Bridge{
-        .alloc = alloc,
-        .cfg = &cfg,
-        .verifier = null,
-        .out = collector.out(),
-        .mode = .legacy,
-        .probed = true,
-    };
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
+    bridge.mode = .legacy;
+    bridge.probed = true;
 
     const init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}";
-    try std.testing.expect((try bridge.dispatchLine(init)) == null); // async
+    bridge.injectLine(init);
 
     // Response correlated by id arrives on the event stream.
-    try std.testing.expect(collector.waitFor("\"id\":1,\"result\":{\"ok\":true}", 5 * std.time.ns_per_s));
+    try std.testing.expect(waitFor(&bridge, &collector, "\"id\":1,\"result\":{\"ok\":true}"));
     // Server-pushed notification was forwarded too.
-    try std.testing.expect(collector.waitFor("notifications/test", 5 * std.time.ns_per_s));
+    try std.testing.expect(waitFor(&bridge, &collector, "notifications/test"));
     // The request id drained the pending set (no dangling waiter).
-    try std.testing.expect(bridge.leg.?.pending.count() == 0);
+    try std.testing.expect(bridge.leg_pending.count() == 0);
     // The endpoint event was captured.
-    try std.testing.expect(bridge.leg.?.ready);
-    try std.testing.expectEqualStrings("/messages?session_id=test-session", bridge.leg.?.endpoint.?.path);
+    try std.testing.expect(bridge.leg_ready);
+    try std.testing.expectEqualStrings("/messages?session_id=test-session", bridge.leg_endpoint.?.path);
 
     bridge.deinit();
     mock.join();
@@ -275,17 +282,13 @@ test "http-first: 405 on POST falls back to legacy SSE" {
     const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/mcp", .{mock.port()});
     defer alloc.free(url);
     var cfg = Config{ .target = try http.parseUrl(url), .url = url, .transport = .http_first };
-    var bridge = Bridge{
-        .alloc = alloc,
-        .cfg = &cfg,
-        .verifier = null,
-        .out = collector.out(),
-    };
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
 
     const init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}";
-    try std.testing.expect((try bridge.dispatchLine(init)) == null); // fell back: async
+    bridge.injectLine(init);
+
+    try std.testing.expect(waitFor(&bridge, &collector, "\"result\":{\"via\":\"sse\"}"));
     try std.testing.expect(bridge.mode == .legacy);
-    try std.testing.expect(collector.waitFor("\"result\":{\"via\":\"sse\"}", 5 * std.time.ns_per_s));
 
     bridge.deinit();
     mock.join();
@@ -333,24 +336,18 @@ test "streamable: standalone GET stream delivers server-initiated messages" {
     const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/mcp", .{mock.port()});
     defer alloc.free(url);
     var cfg = Config{ .target = try http.parseUrl(url), .url = url, .transport = .http_only };
-    var bridge = Bridge{
-        .alloc = alloc,
-        .cfg = &cfg,
-        .verifier = null,
-        .out = collector.out(),
-    };
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
 
     const init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}";
-    var resp = (try bridge.dispatchLine(init)).?;
-    defer resp.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "serverInfo") != null);
+    bridge.injectLine(init);
 
-    // Mimic the main loop: adopt the session id, open the GET stream.
-    try std.testing.expect(resp.mcp_session_id != null);
-    bridge.session_id = try alloc.dupe(u8, resp.mcp_session_id.?);
-    bridge.maybeStartPush();
-
-    try std.testing.expect(collector.waitFor("notifications/tools/list_changed", 5 * std.time.ns_per_s));
+    // The initialize response itself (session id captured internally,
+    // push stream opened automatically).
+    try std.testing.expect(waitFor(&bridge, &collector, "serverInfo"));
+    try std.testing.expect(bridge.session_id != null);
+    try std.testing.expectEqualStrings("sess-123", bridge.session_id.?);
+    // Server-initiated notification arrives on the push stream.
+    try std.testing.expect(waitFor(&bridge, &collector, "notifications/tools/list_changed"));
 
     bridge.deinit();
     mock.join();
@@ -392,9 +389,8 @@ fn mockResumeMain(mock: *Mock) void {
     drainUntilClose(&c2.stream);
 }
 
-test "legacy SSE: reconnect after stream drop resumes with Last-Event-ID" {
+test "legacy SSE: reconnect carries Last-Event-ID after a dropped stream" {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
-    // Registered first, runs last: fail the test on leaks.
     defer if (gpa_state.deinit() == .leak) @panic("memory leak");
     const alloc = gpa_state.allocator();
 
@@ -406,44 +402,127 @@ test "legacy SSE: reconnect after stream drop resumes with Last-Event-ID" {
 
     const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/sse", .{mock.port()});
     defer alloc.free(url);
-    var cfg = Config{ .target = try http.parseUrl(url), .url = url, .transport = .sse_only, .verbose = true };
-    var bridge = Bridge{
-        .alloc = alloc,
-        .cfg = &cfg,
-        .verifier = null,
-        .out = collector.out(),
-        .mode = .legacy,
-        .probed = true,
-    };
+    var cfg = Config{ .target = try http.parseUrl(url), .url = url, .transport = .sse_only };
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
+    bridge.mode = .legacy;
+    bridge.probed = true;
 
     // First stream: endpoint + one pushed message, then the mock drops it.
     // (Production opens the stream lazily on the first stdin line; the
     // test starts it explicitly.)
-    try bridge.startLegacy();
-    try std.testing.expect(collector.waitFor("notifications/before-drop", 5 * std.time.ns_per_s));
-    // Wait until the pump noticed the drop.
-    {
-        var waited: u64 = 0;
-        while (true) {
-            bridge.leg.?.mutex.lock();
-            const dead = bridge.leg.?.dead;
-            bridge.leg.?.mutex.unlock();
-            if (dead) break;
-            if (waited > 5 * std.time.ns_per_s) return error.PumpDidNotNoticeDrop;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-            waited += 10 * std.time.ns_per_ms;
+    bridge.startLegacyTransport(false);
+    try std.testing.expect(waitFor(&bridge, &collector, "notifications/before-drop"));
+
+    // Wait for the bridge to register the drop before sending the next
+    // line (the reconnect must happen via the dead-stream path).
+    const deadCond = struct {
+        fn f(b: *Bridge) bool {
+            return b.leg_dead;
         }
-    }
+    }.f;
+    try std.testing.expect(stepUntil(&bridge, &deadCond));
     // The message id was remembered for resumability.
-    try std.testing.expectEqualStrings("100", bridge.leg.?.last_event_id.?);
+    try std.testing.expectEqualStrings("100", bridge.leg_last_event_id.?);
 
     // Next send reconnects (the mock records whether Last-Event-ID came
     // through) and re-discovers the endpoint from the new stream.
     const call = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{}}";
-    try std.testing.expect((try bridge.dispatchLine(call)) == null);
-    try std.testing.expect(collector.waitFor("\"resumed\":true", 5 * std.time.ns_per_s));
-    try std.testing.expectEqualStrings("/messages?session_id=r2", bridge.leg.?.endpoint.?.path);
+    bridge.injectLine(call);
+
+    try std.testing.expect(waitFor(&bridge, &collector, "\"resumed\":true"));
+    try std.testing.expectEqualStrings("/messages?session_id=r2", bridge.leg_endpoint.?.path);
     try std.testing.expect(mock.last_event_id_seen);
+
+    bridge.deinit();
+    mock.join();
+}
+
+// ----------------------- mock: sampling inside a POST's own SSE stream ----
+
+/// The issue #7 deadlock case: the server answers initialize with an SSE
+/// stream that FIRST carries a server->client sampling request and stays
+/// open; only after the client's answer arrives (on a separate POST) does
+/// the initialize response come. A concurrent tools/list runs in between.
+/// The serial blocking core deadlocked here forever (the main thread was
+/// stuck reading the initialize stream).
+fn mockSamplingMain(mock: *Mock) void {
+    const alloc = mock.alloc;
+
+    // 1: POST /mcp (initialize, id 1) -> SSE stream with a sampling request
+    var c1 = mock.server.accept() catch return;
+    defer c1.stream.close();
+    var req1 = readRequest(alloc, &c1.stream) catch return;
+    req1.deinit(alloc);
+    writeAll(&c1.stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n") catch return;
+    writeAll(&c1.stream, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[]}}\n\n") catch return;
+    // The stream STAYS OPEN while the client works on the answer.
+
+    // 2: a concurrent client request (tools/list, id 2) on its own conn.
+    // Connection: close — the conn must NOT become the bridge's idle
+    // keep-alive, so the sampling answer below deterministically gets a
+    // fresh connection (accept #3).
+    var c2 = mock.server.accept() catch return;
+    defer c2.stream.close();
+    var req2 = readRequest(alloc, &c2.stream) catch return;
+    req2.deinit(alloc);
+    const body2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}";
+    var hb2: [256]u8 = undefined;
+    const resp2 = std.fmt.bufPrint(&hb2, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body2.len, body2 }) catch return;
+    writeAll(&c2.stream, resp2) catch return;
+
+    // 3: the client's sampling answer (id "srv-1") -> 202 Accepted
+    var c3 = mock.server.accept() catch return;
+    defer c3.stream.close();
+    var req3 = readRequest(alloc, &c3.stream) catch return;
+    mock.answer_seen = std.mem.indexOf(u8, req3.body, "\"srv-1\"") != null;
+    req3.deinit(alloc);
+    writeAll(&c3.stream, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n") catch return;
+
+    // 4: only now the initialize response on the (still open) stream 1
+    writeAll(&c1.stream, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"serverInfo\":{\"name\":\"mock\"}}}\n\n") catch return;
+
+    drainUntilClose(&c1.stream);
+    drainUntilClose(&c2.stream);
+}
+
+test "streamable: server request inside a POST SSE stream is answered (no deadlock)" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mockSamplingMain);
+
+    var collector = Collector{ .alloc = alloc };
+    defer collector.deinit();
+
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/mcp", .{mock.port()});
+    defer alloc.free(url);
+    var cfg = Config{ .target = try http.parseUrl(url), .url = url, .transport = .http_only };
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
+
+    const init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}";
+    bridge.injectLine(init);
+
+    // The sampling request is forwarded while the initialize response is
+    // still pending on the same stream.
+    try std.testing.expect(waitFor(&bridge, &collector, "sampling/createMessage"));
+    try std.testing.expect(!collector.contains("\"id\":1,\"result\""));
+
+    // A concurrent request round-trips on its own connection while stream
+    // 1 is still in flight.
+    const tools = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}";
+    bridge.injectLine(tools);
+    try std.testing.expect(waitFor(&bridge, &collector, "\"id\":2,\"result\":{\"tools\":[]}"));
+
+    // The client answers the sampling request; the bridge POSTs it on a
+    // third connection. Only then does the server release initialize.
+    const answer = "{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"result\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"42\"}}}";
+    bridge.injectLine(answer);
+    try std.testing.expect(waitFor(&bridge, &collector, "\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\""));
+
+    // The answer provably arrived while stream 1 was open (mock ordering).
+    try std.testing.expect(mock.answer_seen);
 
     bridge.deinit();
     mock.join();

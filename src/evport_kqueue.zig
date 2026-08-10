@@ -133,6 +133,22 @@ pub const EvPort = struct {
         self.stage(.{ .ident = @intCast(fd), .filter = EVFILT_READ, .flags = EV_DELETE });
     }
 
+    /// Drop STAGED (unflushed) changelist entries for an fd about to be
+    /// closed. close(2) itself removes the fd's live filters; this prevents
+    /// staged entries from applying to a recycled fd number at the next
+    /// wait() flush.
+    pub fn purgeFd(self: *EvPort, fd: c_int) void {
+        const ident: usize = @intCast(fd);
+        var i: usize = 0;
+        while (i < self.changes.items.len) {
+            if (self.changes.items[i].ident == ident) {
+                _ = self.changes.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// Wake a wait() blocked in another thread. Non-blocking; a full pipe
     /// means the loop is already awake (coalesced).
     pub fn wake(self: *EvPort) void {

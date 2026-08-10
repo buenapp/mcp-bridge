@@ -243,7 +243,7 @@ test "httpc post: JSON response with session id" {
 
     const line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
     const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "application/json, text/event-stream", "application/json", &.{}, line);
-    const conn = try httpc.Conn.startPost(alloc, &evp, &hnd, target, req, "1", line, null);
+    const conn = try httpc.Conn.startPost(alloc, &evp, hnd, target, req, "1", line, null);
     try runToDone(&evp, &ctx);
     reap(conn);
 
@@ -288,7 +288,7 @@ test "httpc post: chunked transfer-encoding reassembled" {
 
     const line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}";
     const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "application/json, text/event-stream", "application/json", &.{}, line);
-    const conn = try httpc.Conn.startPost(alloc, &evp, &hnd, target, req, "2", line, null);
+    const conn = try httpc.Conn.startPost(alloc, &evp, hnd, target, req, "2", line, null);
     try runToDone(&evp, &ctx);
     reap(conn);
 
@@ -332,7 +332,7 @@ test "httpc post: SSE-framed response — push events + id match" {
 
     const line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
     const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "application/json, text/event-stream", "application/json", &.{}, line);
-    const conn = try httpc.Conn.startPost(alloc, &evp, &hnd, target, req, "1", line, null);
+    const conn = try httpc.Conn.startPost(alloc, &evp, hnd, target, req, "1", line, null);
     try runToDone(&evp, &ctx);
     reap(conn);
 
@@ -380,7 +380,7 @@ test "httpc sse_get: head, events, clean EOF" {
     const target = try http.parseUrl(url);
 
     const req = try httpc.buildRequest(alloc, "GET", target.path, target.host, "text/event-stream", null, &.{}, null);
-    const conn = try httpc.Conn.startStreamGet(alloc, &evp, &hnd, target, req, null);
+    const conn = try httpc.Conn.startStreamGet(alloc, &evp, hnd, target, req, null);
     try runToDone(&evp, &ctx);
     reap(conn);
 
@@ -425,7 +425,7 @@ test "httpc post: error status surfaces with empty body" {
 
     const line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
     const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "application/json, text/event-stream", "application/json", &.{}, line);
-    const conn = try httpc.Conn.startPost(alloc, &evp, &hnd, target, req, "1", line, null);
+    const conn = try httpc.Conn.startPost(alloc, &evp, hnd, target, req, "1", line, null);
     try runToDone(&evp, &ctx);
     reap(conn);
 
@@ -459,7 +459,7 @@ test "httpc post: connect failure surfaces via onEnd" {
 
     const line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
     const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "application/json, text/event-stream", "application/json", &.{}, line);
-    const conn = try httpc.Conn.startPost(alloc, &evp, &hnd, target, req, "1", line, null);
+    const conn = try httpc.Conn.startPost(alloc, &evp, hnd, target, req, "1", line, null);
     try runToDone(&evp, &ctx);
     reap(conn);
 

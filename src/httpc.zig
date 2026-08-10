@@ -67,6 +67,14 @@ pub const PostCtx = struct {
     line: ?[]const u8 = null,
     /// True when this POST rides a reused keep-alive connection.
     reused: bool = false,
+    /// Which transport created this POST (responses route on this, not on
+    /// the bridge's current mode — a mid-flight mode switch must not
+    /// misroute a streamable response to the legacy handler).
+    kind: enum { streamable, legacy } = .streamable,
+    /// 401 already re-authenticated once (bridge-level retry budget).
+    auth_retried: bool = false,
+    /// A reused-conn failure already retried once on a fresh conn.
+    retried: bool = false,
 };
 
 /// Synchronous callbacks into the bridge (single-threaded; invoked from
@@ -234,7 +242,7 @@ fn bodyMode(h: *const Head) BodyMode {
 pub const Conn = struct {
     alloc: std.mem.Allocator,
     evp: *evport.EvPort,
-    handler: *const Handler,
+    handler: Handler,
     role: Role,
     target: http.Target,
 
@@ -283,7 +291,7 @@ pub const Conn = struct {
     pub fn startPost(
         alloc: std.mem.Allocator,
         evp: *evport.EvPort,
-        handler: *const Handler,
+        handler: Handler,
         target: http.Target,
         request: std.ArrayList(u8),
         expect_id: ?[]const u8,
@@ -301,7 +309,7 @@ pub const Conn = struct {
     pub fn startStreamGet(
         alloc: std.mem.Allocator,
         evp: *evport.EvPort,
-        handler: *const Handler,
+        handler: Handler,
         target: http.Target,
         request: std.ArrayList(u8),
         verifier: ?*platform.Verifier,
@@ -312,7 +320,7 @@ pub const Conn = struct {
     fn start(
         alloc: std.mem.Allocator,
         evp: *evport.EvPort,
-        handler: *const Handler,
+        handler: Handler,
         target: http.Target,
         request: std.ArrayList(u8),
         role: Role,
