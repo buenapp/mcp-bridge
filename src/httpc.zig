@@ -338,12 +338,12 @@ pub const Conn = struct {
         };
         errdefer conn.deinitMem();
 
-        conn.stream = nb.Stream.startConnect(alloc, target.host, target.port, evp, conn) catch return Error.ConnectFailed;
+        nb.Stream.startConnectInto(&conn.stream, alloc, target.host, target.port, evp, conn) catch return Error.ConnectFailed;
 
         // Persistent edge-triggered read interest for the conn's whole
         // life; one-shot write interest for connect completion (the event
-        // port dedups write arms). On IOCP these are the association +
-        // in-flight connect posted inside startConnect.
+        // port dedups write arms). On IOCP these are no-ops — the
+        // association + in-flight connect happened inside startConnectInto.
         evp.monitorRead(conn.stream.fd(), conn);
         evp.wantWrite(conn.stream.fd(), conn);
         return conn;
@@ -600,7 +600,13 @@ pub const Conn = struct {
             self.write_ready = false;
             progressed = true;
         }
-        if (self.read_ready) {
+        if (platform.is_windows) {
+            // IOCP is completion-based: there is no read readiness — the
+            // conn always keeps a recv outstanding. Pull unconditionally;
+            // readNb posts the next recv when the buffer runs dry.
+            if (self.drainWire()) progressed = true;
+            if (self.closing or self.state == .done) return progressed;
+        } else if (self.read_ready) {
             if (self.drainWire()) progressed = true;
             if (self.closing or self.state == .done) return progressed;
         }
@@ -623,7 +629,7 @@ pub const Conn = struct {
         // Any event on an idle keep-alive conn ends it: EOF (server closed)
         // or unexpected bytes (protocol violation) — either way the bridge
         // drops it from the pool. A stale edge with no data is ignored.
-        if (!self.read_ready) return false;
+        if (!platform.is_windows and !self.read_ready) return false;
         var tmp: [1024]u8 = undefined;
         const r = self.stream.readNb(&tmp) catch {
             self.state = .done;
@@ -631,6 +637,8 @@ pub const Conn = struct {
             return false;
         };
         switch (r) {
+            // IOCP: the posted recv is outstanding — still idle.
+            // POSIX: a stale edge with no data — re-arm.
             .want_read, .want_write => {
                 self.read_ready = false;
                 return false;
@@ -647,7 +655,10 @@ pub const Conn = struct {
     fn drainWire(self: *Conn) bool {
         var any = false;
         var tmp: [16384]u8 = undefined;
-        while (self.read_ready) {
+        // POSIX: only pull when a read edge was delivered (EV_CLEAR
+        // contract). IOCP: pull unconditionally — readNb keeps a recv
+        // outstanding and returns want_read when dry.
+        while (platform.is_windows or self.read_ready) {
             const r = self.stream.readNb(&tmp) catch |err| {
                 self.fail(switch (err) {
                     error.TlsError => error.TlsError,
@@ -667,17 +678,22 @@ pub const Conn = struct {
                     };
                     any = true;
                 },
-                .want_read => self.read_ready = false,
+                .want_read => {
+                    if (!platform.is_windows) self.read_ready = false;
+                    break;
+                },
                 .want_write => {
                     self.read_want_write = true;
-                    self.read_ready = false;
+                    if (!platform.is_windows) self.read_ready = false;
                     self.armWrite();
+                    break;
                 },
                 .eof => {
                     // Buffered bytes parse first; finalizeEof applies the
                     // per-state EOF semantics after the last parseStep.
                     self.wire_eof = true;
-                    self.read_ready = false;
+                    if (!platform.is_windows) self.read_ready = false;
+                    break;
                 },
             }
         }

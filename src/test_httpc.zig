@@ -9,100 +9,13 @@ const httpc = @import("httpc.zig");
 const evport = @import("evport.zig");
 const sse = @import("sse.zig");
 
-// ------------------------------------------------------------ mock HTTP ----
-
-const Req = struct {
-    method: []u8,
-    path: []u8,
-    body: []u8,
-    head: []u8,
-
-    fn deinit(self: *Req, alloc: std.mem.Allocator) void {
-        alloc.free(self.method);
-        alloc.free(self.path);
-        alloc.free(self.body);
-        alloc.free(self.head);
-    }
-};
-
-fn readRequest(alloc: std.mem.Allocator, stream: *std.net.Stream) !Req {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    var tmp: [4096]u8 = undefined;
-    while (std.mem.indexOf(u8, buf.items, "\r\n\r\n") == null) {
-        const n = try stream.read(&tmp);
-        if (n == 0) return error.Closed;
-        try buf.appendSlice(alloc, tmp[0..n]);
-    }
-    const he = std.mem.indexOf(u8, buf.items, "\r\n\r\n").?;
-    const head = buf.items[0..he];
-
-    const sp1 = std.mem.indexOf(u8, head, " ") orelse return error.Malformed;
-    const sp2 = std.mem.indexOfPos(u8, head, sp1 + 1, " ") orelse return error.Malformed;
-
-    var content_length: usize = 0;
-    var it = std.mem.splitSequence(u8, head, "\r\n");
-    _ = it.next();
-    while (it.next()) |line| {
-        const colon = std.mem.indexOf(u8, line, ":") orelse continue;
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), "content-length")) {
-            content_length = std.fmt.parseInt(usize, std.mem.trim(u8, line[colon + 1 ..], " "), 10) catch 0;
-        }
-    }
-
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(alloc);
-    try body.appendSlice(alloc, buf.items[he + 4 ..]);
-    while (body.items.len < content_length) {
-        const n = try stream.read(&tmp);
-        if (n == 0) return error.Closed;
-        try body.appendSlice(alloc, tmp[0..n]);
-    }
-
-    return .{
-        .method = try alloc.dupe(u8, head[0..sp1]),
-        .path = try alloc.dupe(u8, head[sp1 + 1 .. sp2]),
-        .body = try alloc.dupe(u8, body.items[0..@min(body.items.len, content_length)]),
-        .head = try alloc.dupe(u8, head),
-    };
-}
-
-fn writeAll(stream: *std.net.Stream, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) off += try stream.write(bytes[off..]);
-}
-
-fn drainUntilClose(stream: *std.net.Stream) void {
-    var tmp: [4096]u8 = undefined;
-    while (true) {
-        const n = stream.read(&tmp) catch return;
-        if (n == 0) return;
-    }
-}
-
-const Mock = struct {
-    alloc: std.mem.Allocator,
-    server: std.net.Server,
-    thread: ?std.Thread = null,
-
-    fn start(alloc: std.mem.Allocator) !Mock {
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        return .{ .alloc = alloc, .server = try addr.listen(.{}) };
-    }
-
-    fn port(self: *const Mock) u16 {
-        return self.server.listen_address.getPort();
-    }
-
-    fn spawn(self: *Mock, comptime handler: fn (*Mock) void) !void {
-        self.thread = try std.Thread.spawn(.{}, handler, .{self});
-    }
-
-    fn join(self: *Mock) void {
-        if (self.thread) |t| t.join();
-        self.server.deinit();
-    }
-};
+const testkit = @import("testkit.zig");
+const Req = testkit.Req;
+const readRequest = testkit.readRequest;
+const writeAll = testkit.sockWriteAll;
+const drainUntilClose = testkit.drainUntilClose;
+const Mock = testkit.Mock;
+const sockClose = testkit.sockClose;
 
 // -------------------------------------------------------- test harness ----
 
@@ -213,7 +126,7 @@ fn reap(conn: *httpc.Conn) void {
 fn mockJsonMain(mock: *Mock) void {
     const alloc = mock.alloc;
     var c = mock.server.accept() catch return;
-    defer c.stream.close();
+    defer sockClose(&c.stream);
     var req = readRequest(alloc, &c.stream) catch return;
     defer req.deinit(alloc);
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}";
@@ -258,7 +171,7 @@ test "httpc post: JSON response with session id" {
 fn mockChunkedMain(mock: *Mock) void {
     const alloc = mock.alloc;
     var c = mock.server.accept() catch return;
-    defer c.stream.close();
+    defer sockClose(&c.stream);
     var req = readRequest(alloc, &c.stream) catch return;
     defer req.deinit(alloc);
     writeAll(&c.stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n") catch return;
@@ -301,7 +214,7 @@ test "httpc post: chunked transfer-encoding reassembled" {
 fn mockSsePostMain(mock: *Mock) void {
     const alloc = mock.alloc;
     var c = mock.server.accept() catch return;
-    defer c.stream.close();
+    defer sockClose(&c.stream);
     var req = readRequest(alloc, &c.stream) catch return;
     defer req.deinit(alloc);
     writeAll(&c.stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n") catch return;
@@ -351,14 +264,14 @@ fn mockSseGetMain(mock: *Mock) void {
     const alloc = mock.alloc;
     var c = mock.server.accept() catch return;
     var req = readRequest(alloc, &c.stream) catch {
-        c.stream.close();
+        sockClose(&c.stream);
         return;
     };
     defer req.deinit(alloc);
     writeAll(&c.stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n") catch return;
     writeAll(&c.stream, "event: endpoint\ndata: /messages?session_id=t1\n\n") catch return;
     writeAll(&c.stream, "event: message\nid: ev-9\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/y\"}\n\n") catch return;
-    c.stream.close(); // clean stream end
+    sockClose(&c.stream); // clean stream end
 }
 
 test "httpc sse_get: head, events, clean EOF" {
@@ -398,7 +311,7 @@ test "httpc sse_get: head, events, clean EOF" {
 fn mock404Main(mock: *Mock) void {
     const alloc = mock.alloc;
     var c = mock.server.accept() catch return;
-    defer c.stream.close();
+    defer sockClose(&c.stream);
     var req = readRequest(alloc, &c.stream) catch return;
     defer req.deinit(alloc);
     writeAll(&c.stream, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch return;

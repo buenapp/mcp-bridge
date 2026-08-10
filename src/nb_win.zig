@@ -29,6 +29,12 @@ pub const Fd = win.SOCKET;
 const ws2 = win.ws2;
 const kernel32 = windows.kernel32;
 
+pub var debug_probe: bool = false;
+
+fn dbg(comptime fmt: []const u8, args: anytype) void {
+    if (debug_probe) std.debug.print(fmt, args);
+}
+
 /// Same outcome shapes as the POSIX nb layer.
 pub const NbRead = union(enum) {
     data: usize,
@@ -61,7 +67,6 @@ pub const CompletionKind = enum { recv, send, connect, unknown };
 
 const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC8000006;
 const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
-const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u32 = 2;
 
 var connect_ex_ptr: ?ConnectExFn = null; // cached at first use
 
@@ -135,9 +140,13 @@ pub const PlainNb = struct {
     send_just_done: ?usize = null,
     send_err: ?usize = null,
 
-    /// Overlapped connect to host:port. The socket is associated with the
-    /// event port (`key` = the conn) before ConnectEx posts.
-    pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16, evp: *evport.EvPort, key: ?*anyopaque) IoError!PlainNb {
+    /// Overlapped connect to host:port, CONSTRUCTED IN PLACE at `dest`
+    /// (the OVERLAPPED structs are registered with in-flight ops — a
+    /// by-value return would orphan the connect completion's address).
+    /// The socket is associated with the event port (`key` = the conn)
+    /// before ConnectEx posts.
+    pub fn startConnectInto(self: *PlainNb, alloc: std.mem.Allocator, host: []const u8, port: u16, evp: *evport.EvPort, key: ?*anyopaque) IoError!void {
+        self.* = .{};
         try ensureWsa();
         const addr_list = std.net.getAddressList(alloc, host, port) catch return IoError.ConnectFailed;
         defer addr_list.deinit();
@@ -148,28 +157,24 @@ pub const PlainNb = struct {
             const s = ws2.socket(addr.any.family, ws2.SOCK.STREAM, 0);
             if (s == win.INVALID_SOCKET) continue;
 
-            // ConnectEx requires the socket bound first (wildcard).
-            const bind_addr: windows.ws2_32.sockaddr = switch (addr.any.family) {
-                2 => blk: { // AF.INET
-                    var a: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
-                    a.family = 2;
-                    break :blk @bitCast(a);
-                },
-                else => addr.any, // v6 wildcard as-is
+            // ConnectEx requires the socket bound first (wildcard, target's
+            // address family — use a std.net.Address so the layout is
+            // target-correct).
+            const any_addr = switch (addr.any.family) {
+                2 => std.net.Address.parseIp4("0.0.0.0", 0) catch unreachable,
+                else => std.net.Address.parseIp6("::", 0) catch unreachable,
             };
-            const bind_len: i32 = @intCast(if (addr.any.family == 2) @sizeOf(std.posix.sockaddr.in) else addr.getOsSockLen());
-            if (ws2.bind(s, &bind_addr, bind_len) != 0) {
+            if (ws2.bind(s, &any_addr.any, @intCast(any_addr.getOsSockLen())) != 0) {
                 _ = ws2.closesocket(s);
                 continue;
             }
 
             evp.monitorRead(s, key); // associate with the port
-            // Immediately-completed ops don't post completions.
-            _ = kernel32.SetFileCompletionNotificationModes(s, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
 
-            var self = PlainNb{ .sock = s };
+            self.sock = s;
             const cx = connectEx(s) catch {
                 _ = ws2.closesocket(s);
+                self.sock = win.INVALID_SOCKET;
                 continue;
             };
             const rc = cx(s, @ptrCast(&addr.any), @intCast(addr.getOsSockLen()), null, 0, null, &self.conn_ov);
@@ -177,22 +182,24 @@ pub const PlainNb = struct {
                 // Completed inline.
                 self.connect_done = true;
                 self.postConnectSetup();
-                return self;
+                return;
             }
             const e = ws2.WSAGetLastError();
             if (e != .WSA_IO_PENDING) {
                 _ = ws2.closesocket(s);
+                self.sock = win.INVALID_SOCKET;
                 last_err = IoError.ConnectFailed;
                 continue;
             }
             self.connect_pending = true;
-            return self;
+            return;
         }
         return last_err;
     }
 
     fn postConnectSetup(self: *PlainNb) void {
-        _ = ws2.setsockopt(self.sock, win.SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, null, 0);
+        const rc = ws2.setsockopt(self.sock, win.SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, null, 0);
+        dbg("nbwin: SO_UPDATE_CONNECT_CONTEXT rc={d} err={d}\n", .{ rc, @intFromEnum(ws2.WSAGetLastError()) });
     }
 
     /// Confirm the connect after its completion (or inline completion).
@@ -235,7 +242,7 @@ pub const PlainNb = struct {
 
     pub fn readNb(self: *PlainNb, out: []u8) IoError!NbRead {
         if (self.recv_err != null) return IoError.SocketError;
-        // Serve buffered bytes first.
+        // Serve buffered bytes first (they arrived via completion).
         if (self.recv_have > 0) {
             const n = @min(out.len, self.recv_have - self.recv_off);
             @memcpy(out[0..n], self.recv_buf[self.recv_off .. self.recv_off + n]);
@@ -245,23 +252,13 @@ pub const PlainNb = struct {
         }
         if (self.recv_eof) return .eof;
         if (self.recv_pending) return .want_read;
-        // Post the next overlapped read.
+        // Post the next overlapped read. Sockets ALWAYS queue a completion
+        // (even on inline success), so all data arrives via absorbCompletion.
         var buf = ws2.WSABUF{ .len = self.recv_buf.len, .buf = &self.recv_buf };
         var flags: u32 = 0;
-        var got: u32 = 0;
-        const rc = ws2.WSARecv(self.sock, @ptrCast(&buf), 1, &got, &flags, &self.recv_ov, null);
-        if (rc == 0) {
-            // Completed inline (SKIP_COMPLETION_PORT_ON_SUCCESS).
-            if (got == 0) {
-                self.recv_eof = true;
-                return .eof;
-            }
-            self.recv_off = 0;
-            self.recv_have = @intCast(got);
-            return self.readNb(out);
-        }
-        const e = ws2.WSAGetLastError();
-        if (e == .WSA_IO_PENDING) {
+        const rc = ws2.WSARecv(self.sock, @ptrCast(&buf), 1, null, &flags, &self.recv_ov, null);
+        dbg("nbwin: WSARecv post rc={d} err={d}\n", .{ rc, @intFromEnum(ws2.WSAGetLastError()) });
+        if (rc == 0 or ws2.WSAGetLastError() == .WSA_IO_PENDING) {
             self.recv_pending = true;
             return .want_read;
         }
@@ -269,7 +266,8 @@ pub const PlainNb = struct {
     }
 
     pub fn writeNb(self: *PlainNb, data: []const u8) IoError!NbWrite {
-        // Account for a completed pending send first.
+        // Account for a completed pending send first (completions carry the
+        // byte count — inline WSASend success still queues a completion).
         if (self.send_just_done) |n| {
             self.send_just_done = null;
             return .{ .done = n };
@@ -279,11 +277,8 @@ pub const PlainNb = struct {
         if (data.len == 0) return .{ .done = 0 };
 
         var buf = ws2.WSABUF{ .len = @intCast(data.len), .buf = @constCast(data.ptr) };
-        var sent: u32 = 0;
-        const rc = ws2.WSASend(self.sock, @ptrCast(&buf), 1, &sent, 0, &self.send_ov, null);
-        if (rc == 0) return .{ .done = sent }; // inline completion, no event queued
-        const e = ws2.WSAGetLastError();
-        if (e == .WSA_IO_PENDING) {
+        const rc = ws2.WSASend(self.sock, @ptrCast(&buf), 1, null, 0, &self.send_ov, null);
+        if (rc == 0 or ws2.WSAGetLastError() == .WSA_IO_PENDING) {
             self.send_pending = true;
             return .want_write;
         }
@@ -330,8 +325,9 @@ pub const Stream = union(enum) {
         };
     }
 
-    pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16, evp: *evport.EvPort, key: ?*anyopaque) IoError!Stream {
-        return .{ .plain = try PlainNb.startConnect(alloc, host, port, evp, key) };
+    pub fn startConnectInto(self: *Stream, alloc: std.mem.Allocator, host: []const u8, port: u16, evp: *evport.EvPort, key: ?*anyopaque) IoError!void {
+        self.* = .{ .plain = .{} };
+        return self.plain.startConnectInto(alloc, host, port, evp, key);
     }
 
     pub fn connectDone(self: *Stream) IoError!void {

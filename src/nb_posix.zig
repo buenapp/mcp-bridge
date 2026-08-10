@@ -34,12 +34,14 @@ pub const Stream = union(enum) {
         };
     }
 
-    /// Start a non-blocking TCP connect (all conns begin as .plain).
-    /// The evp/key params are the Windows (IOCP) association — unused here.
-    pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16, evp: anytype, key: ?*anyopaque) PlainNb.Error!Stream {
+    /// Start a non-blocking TCP connect (all conns begin as .plain),
+    /// constructed in place at `dest` (in-place matches the IOCP backend —
+    /// overlapped ops register struct addresses). evp/key are the Windows
+    /// association params — unused here.
+    pub fn startConnectInto(self: *Stream, alloc: std.mem.Allocator, host: []const u8, port: u16, evp: anytype, key: ?*anyopaque) PlainNb.Error!void {
         _ = evp;
         _ = key;
-        return .{ .plain = try PlainNb.startConnect(alloc, host, port) };
+        self.* = .{ .plain = try PlainNb.startConnect(alloc, host, port) };
     }
 
     /// Confirm the connect after the first write event (SO_ERROR).
