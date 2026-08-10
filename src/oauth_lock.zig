@@ -237,9 +237,6 @@ test "lockfile: stale lock (dead pid) is taken over" {
     defer alloc.free(dir);
 
     // Dead pid (above every platform's maxpid) + a closed port.
-    var sock: std.posix.fd_t = undefined;
-    const closed_port = try testListener(&sock);
-    std.posix.close(sock);
     const lock_path = try oauth.lockPathIn(alloc, dir, "https://a.example/mcp", null);
     defer alloc.free(lock_path);
     {
@@ -260,7 +257,6 @@ test "lockfile: stale lock (dead pid) is taken over" {
     const info = readLock(alloc, lock_path).?;
     try std.testing.expectEqual(std.c.getpid(), info.pid);
     try std.testing.expectEqual(port, info.port);
-    _ = closed_port;
 }
 
 test "lockfile: corrupt lock is taken over" {
