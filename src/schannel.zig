@@ -175,6 +175,7 @@ pub const TlsNb = struct {
             // Handshake complete; stream sizes drive encrypt framing.
             const qs = win.QueryContextAttributesW(&self.ctx, win.SECPKG_ATTR_STREAM_SIZES, &self.sizes);
             if (!win.SUCCEEDED(qs)) return TlsError.HandshakeFailed;
+            vprint("mcp-bridge: [tls] handshake complete\n", .{});
             return true;
         }
         if (status == win.SEC_I_CONTINUE_NEEDED or status == win.SEC_E_INCOMPLETE_MESSAGE) {
@@ -193,8 +194,11 @@ pub const TlsNb = struct {
             log.err("no remote cert context: 0x{x:0>8}", .{@as(u32, @bitCast(status))});
             return false;
         }
+        vprint("mcp-bridge: [tls] verifying certificate\n", .{});
         defer _ = win.CertFreeCertificateContext(remote_cert);
-        return platform.Verifier.verifyOpaque(v, remote_cert.?);
+        const ok = platform.Verifier.verifyOpaque(v, remote_cert.?);
+        if (ok) vprint("mcp-bridge: [tls] certificate accepted\n", .{});
+        return ok;
     }
 
     // -------------------------------------------------------------- read --

@@ -15,6 +15,10 @@ const log = std.log.scoped(.tls_openssl);
 
 pub var verbose: bool = false;
 
+fn vprint(comptime fmt: []const u8, args: anytype) void {
+    if (verbose) std.debug.print(fmt, args);
+}
+
 pub const TlsError = error{
     ConnectFailed,
     SslInitFailed,
@@ -76,6 +80,7 @@ pub const TlsNb = struct {
         if (c.SSL_set_fd(ssl, @intCast(sock)) != 1) return TlsError.SslInitFailed;
         c.SSL_set_connect_state(ssl);
 
+        vprint("mcp-bridge: [tls] handshaking\n", .{});
         // SNI
         var host_z: [256]u8 = undefined;
         if (host.len >= host_z.len) return TlsError.SslInitFailed;
@@ -90,7 +95,10 @@ pub const TlsNb = struct {
     /// direction and call again on the event.
     pub fn handshakeDrive(self: *TlsNb) TlsError!Drive {
         const ret = c.SSL_connect(self.ssl.?);
-        if (ret == 1) return .done;
+        if (ret == 1) {
+            vprint("mcp-bridge: [tls] handshake complete\n", .{});
+            return .done;
+        }
         const err = c.SSL_get_error(self.ssl.?, ret);
         switch (err) {
             c.SSL_ERROR_WANT_READ => return .want_read,

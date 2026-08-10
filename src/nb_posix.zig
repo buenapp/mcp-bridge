@@ -41,6 +41,7 @@ pub const Stream = union(enum) {
     pub fn startConnectInto(self: *Stream, alloc: std.mem.Allocator, host: []const u8, port: u16, evp: anytype, key: ?*anyopaque) PlainNb.Error!void {
         _ = evp;
         _ = key;
+        if (tls_openssl.verbose) std.debug.print("mcp-bridge: [tls] resolving {s}:{d}\n", .{ host, port });
         self.* = .{ .plain = try PlainNb.startConnect(alloc, host, port) };
     }
 
@@ -78,8 +79,11 @@ pub const Stream = union(enum) {
             .plain => true,
             .tls => |*s| {
                 const ssl = s.ssl orelse return false;
+                if (tls_openssl.verbose) std.debug.print("mcp-bridge: [tls] verifying certificate\n", .{});
                 if (openssl.c.SSL_get0_peer_certificate(ssl) == null) return false;
-                return platform.Verifier.verifyOpaque(v, ssl);
+                const ok = platform.Verifier.verifyOpaque(v, ssl);
+                if (ok and tls_openssl.verbose) std.debug.print("mcp-bridge: [tls] certificate accepted\n", .{});
+                return ok;
             },
         };
     }
