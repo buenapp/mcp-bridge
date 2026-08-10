@@ -20,6 +20,7 @@ comptime {
     // Backend tests live in the per-platform files; reference the ones for
     // this host so their tests are discovered.
     if (builtin.os.tag == .freebsd) _ = @import("evport_kqueue.zig");
+    if (builtin.os.tag == .linux) _ = @import("evport_epoll.zig");
     if (builtin.os.tag != .windows) {
         _ = @import("posix.zig");
         _ = @import("tls_openssl.zig");

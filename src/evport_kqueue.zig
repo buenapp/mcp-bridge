@@ -84,6 +84,10 @@ pub const EvPort = struct {
     changes: std.ArrayList(Kevent) = .empty,
     wake_r: c_int = -1,
     wake_w: c_int = -1,
+    /// fds with write interest currently registered (staged or live).
+    /// Deduplicates wantWrite/cancelWrite across the one-shot lifecycle:
+    /// delivery clears the bit, so a blocked writer re-arms exactly once.
+    armed_write: std.AutoHashMapUnmanaged(c_int, void) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) Error!EvPort {
         const kq = kqueue();
@@ -110,6 +114,7 @@ pub const EvPort = struct {
         self.wake_r = -1;
         self.wake_w = -1;
         self.changes.deinit(self.alloc);
+        self.armed_write.deinit(self.alloc);
     }
 
     /// Persistent edge-triggered read interest (EV_ADD | EV_CLEAR).
@@ -118,13 +123,16 @@ pub const EvPort = struct {
     }
 
     /// One-shot write interest (EV_ADD | EV_ONESHOT): connect completion or
-    /// send-buffer space after a short write.
-    pub fn monitorWrite(self: *EvPort, fd: c_int, udata: ?*anyopaque) void {
+    /// send-buffer space after a short write. No-op while already armed.
+    pub fn wantWrite(self: *EvPort, fd: c_int, udata: ?*anyopaque) void {
+        if (self.armed_write.contains(fd)) return;
+        self.armed_write.put(self.alloc, fd, {}) catch return;
         self.stage(.{ .ident = @intCast(fd), .filter = EVFILT_WRITE, .flags = EV_ADD | EV_ONESHOT, .udata = udata });
     }
 
     /// Drop write interest on an fd that STAYS OPEN (flow control only).
-    pub fn unmonitorWrite(self: *EvPort, fd: c_int) void {
+    pub fn cancelWrite(self: *EvPort, fd: c_int) void {
+        if (!self.armed_write.remove(fd)) return;
         self.stage(.{ .ident = @intCast(fd), .filter = EVFILT_WRITE, .flags = EV_DELETE });
     }
 
@@ -134,10 +142,11 @@ pub const EvPort = struct {
     }
 
     /// Drop STAGED (unflushed) changelist entries for an fd about to be
-    /// closed. close(2) itself removes the fd's live filters; this prevents
-    /// staged entries from applying to a recycled fd number at the next
-    /// wait() flush.
+    /// closed, plus its armed-write bit. close(2) itself removes the fd's
+    /// live filters; this prevents staged entries from applying to a
+    /// recycled fd number at the next wait() flush.
     pub fn purgeFd(self: *EvPort, fd: c_int) void {
+        _ = self.armed_write.remove(fd);
         const ident: usize = @intCast(fd);
         var i: usize = 0;
         while (i < self.changes.items.len) {
@@ -193,6 +202,10 @@ pub const EvPort = struct {
                     out += 1;
                 }
                 continue;
+            }
+            if (kev.filter == EVFILT_WRITE) {
+                // One-shot consumed: the writer must re-arm explicitly.
+                _ = self.armed_write.remove(@intCast(kev.ident));
             }
             events[out] = .{
                 .udata = kev.udata,
@@ -267,16 +280,16 @@ test "kqueue: one-shot write interest re-arms on demand" {
     defer _ = std.c.close(fds[1]);
 
     var tag: u8 = 2;
-    evp.monitorWrite(fds[1], &tag);
+    evp.wantWrite(fds[1], &tag);
 
     var events: [8]Event = undefined;
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].writable);
 
-    // ONESHOT consumed: no second delivery without re-arming.
+    // One-shot consumed: no second delivery without re-arming.
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 
-    evp.monitorWrite(fds[1], &tag);
+    evp.wantWrite(fds[1], &tag);
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].writable);
 }
@@ -337,7 +350,7 @@ test "kqueue: non-blocking connect completes via write filter" {
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
     var tag: u8 = 4;
-    evp.monitorWrite(s, &tag);
+    evp.wantWrite(s, &tag);
 
     var events: [8]Event = undefined;
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));

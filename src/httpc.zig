@@ -256,7 +256,6 @@ pub const Conn = struct {
     // ---- write side ----
     wq: std.ArrayList(u8) = .empty, // request bytes
     wpos: usize = 0,
-    write_armed: bool = false, // one-shot write filter staged, undelivered
     write_ready: bool = false, // write edge seen, not yet consumed
     write_blocked: bool = false, // last writeNb said want_write
     write_want_read: bool = false, // TLS writeNb said want_read
@@ -341,10 +340,10 @@ pub const Conn = struct {
         conn.stream = nb.Stream.startConnect(alloc, target.host, target.port) catch return Error.ConnectFailed;
 
         // Persistent edge-triggered read interest for the conn's whole
-        // life; one-shot write interest for connect completion.
+        // life; one-shot write interest for connect completion (the event
+        // port dedups write arms).
         evp.monitorRead(conn.stream.fd(), conn);
-        evp.monitorWrite(conn.stream.fd(), conn);
-        conn.write_armed = true;
+        evp.wantWrite(conn.stream.fd(), conn);
         return conn;
     }
 
@@ -442,16 +441,12 @@ pub const Conn = struct {
     pub fn onEvent(self: *Conn, ev: evport.Event) void {
         if (self.closing) return;
         if (ev.readable) self.read_ready = true;
-        if (ev.writable) {
-            self.write_ready = true;
-            self.write_armed = false; // one-shot consumed
-        }
+        if (ev.writable) self.write_ready = true;
         if (ev.err) {
             // Connect failures surface via SO_ERROR in connectDone; a stray
             // EV_ERROR post-connect is discovered by the next I/O attempt.
             self.read_ready = true;
             self.write_ready = true;
-            self.write_armed = false;
         }
         self.drive();
     }
@@ -532,10 +527,7 @@ pub const Conn = struct {
 
     fn driveWrite(self: *Conn) bool {
         if (self.wpos >= self.wq.items.len) {
-            if (self.write_armed) {
-                self.evp.unmonitorWrite(self.fd());
-                self.write_armed = false;
-            }
+            self.evp.cancelWrite(self.fd());
             self.state = .read_head;
             self.wq.clearRetainingCapacity();
             self.wpos = 0;
@@ -859,9 +851,8 @@ pub const Conn = struct {
     }
 
     fn armWrite(self: *Conn) void {
-        if (self.write_armed or self.closing) return;
-        self.evp.monitorWrite(self.fd(), self);
-        self.write_armed = true;
+        if (self.closing) return;
+        self.evp.wantWrite(self.fd(), self);
     }
 
     /// Drop consumed bytes so long-lived streams don't grow `in`

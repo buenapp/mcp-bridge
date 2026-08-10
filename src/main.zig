@@ -154,7 +154,6 @@ pub const Bridge = struct {
 
     // ---- stdout write queue (production; tests use a memory sink) ----
     stdout_q: std.ArrayList(u8) = .empty,
-    stdout_armed: bool = false, // one-shot write interest staged/delivered-pending
     stdout_is_fd: bool = false,
     stdout_dead: bool = false, // EPIPE: the IDE is gone; drop queued output
 
@@ -255,10 +254,7 @@ pub const Bridge = struct {
     fn queueStdout(self: *Bridge, bytes: []const u8) void {
         if (!self.stdout_is_fd or self.stdout_dead) return;
         self.stdout_q.appendSlice(self.alloc, bytes) catch {};
-        if (!self.stdout_armed) {
-            self.evp.monitorWrite(std.posix.STDOUT_FILENO, @as(?*anyopaque, &stdout_sentinel));
-            self.stdout_armed = true;
-        }
+        self.evp.wantWrite(std.posix.STDOUT_FILENO, @as(?*anyopaque, &stdout_sentinel));
     }
 
     fn stdoutWriteFn(ctx: *anyopaque, bytes: []const u8) void {
@@ -272,18 +268,18 @@ pub const Bridge = struct {
     }
 
     fn onStdoutWritable(self: *Bridge) void {
-        self.stdout_armed = false; // one-shot consumed
         while (self.stdout_q.items.len > 0) {
             const n = std.posix.write(std.posix.STDOUT_FILENO, self.stdout_q.items) catch |err| switch (err) {
                 error.WouldBlock => {
-                    self.evp.monitorWrite(std.posix.STDOUT_FILENO, @as(?*anyopaque, &stdout_sentinel));
-                    self.stdout_armed = true;
+                    // Re-arm (kqueue one-shot consumed; epoll no-op).
+                    self.evp.wantWrite(std.posix.STDOUT_FILENO, @as(?*anyopaque, &stdout_sentinel));
                     return;
                 },
                 else => {
                     // EPIPE etc: the client is gone — drop the queue.
                     self.stdout_dead = true;
                     self.stdout_q.clearRetainingCapacity();
+                    self.evp.cancelWrite(std.posix.STDOUT_FILENO);
                     return;
                 },
             };
@@ -291,6 +287,9 @@ pub const Bridge = struct {
             std.mem.copyForwards(u8, self.stdout_q.items[0..rest], self.stdout_q.items[n..]);
             self.stdout_q.items.len = rest;
         }
+        // Queue empty: drop the interest (level-triggered backends would
+        // otherwise keep reporting writability).
+        self.evp.cancelWrite(std.posix.STDOUT_FILENO);
     }
 
     /// Stdin readable: drain to EAGAIN, split complete lines, dispatch.

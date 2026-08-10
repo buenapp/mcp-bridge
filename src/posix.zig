@@ -113,7 +113,7 @@ test "PlainNb: non-blocking connect + round trip over loopback" {
     var evp = try evport.EvPort.init(alloc);
     defer evp.deinit();
     var tag: u8 = 9;
-    evp.monitorWrite(client.sock, &tag);
+    evp.wantWrite(client.sock, &tag);
 
     var events: [8]evport.Event = undefined;
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
@@ -170,7 +170,7 @@ test "PlainNb: connect refused surfaces at connectDone" {
     var evp = try evport.EvPort.init(alloc);
     defer evp.deinit();
     var tag: u8 = 10;
-    evp.monitorWrite(client.sock, &tag);
+    evp.wantWrite(client.sock, &tag);
 
     var events: [8]evport.Event = undefined;
     _ = try evp.wait(&events, 1000);
