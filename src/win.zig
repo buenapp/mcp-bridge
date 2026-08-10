@@ -40,9 +40,27 @@ pub extern "kernel32" fn WriteFile(
 ) BOOL;
 pub extern "kernel32" fn GetLastError() DWORD;
 
+// ------------------------------------------------------- IOCP / events --
+
+pub const FILE_TYPE_PIPE: DWORD = 0x0003;
+pub const FILE_TYPE_CHAR: DWORD = 0x0002;
+pub const FILE_TYPE_DISK: DWORD = 0x0001;
+pub const INFINITE: DWORD = 0xFFFFFFFF;
+
+pub extern "kernel32" fn GetFileType(hFile: HANDLE) DWORD;
+pub extern "kernel32" fn CreateEventExW(
+    lpEventAttributes: ?*anyopaque,
+    lpName: ?[*:0]const u16,
+    dwFlags: DWORD,
+    dwDesiredAccess: DWORD,
+) ?HANDLE;
+pub extern "kernel32" fn SetEvent(hEvent: HANDLE) BOOL;
+pub extern "kernel32" fn CloseHandle(hObject: HANDLE) BOOL;
+
 // --------------------------------------------------------------- winsock --
 
 pub const ws2 = std.os.windows.ws2_32;
+pub const kernel32 = std.os.windows.kernel32;
 pub const SOCKET = ws2.SOCKET;
 pub const INVALID_SOCKET = ws2.INVALID_SOCKET;
 

@@ -157,6 +157,11 @@ pub const Bridge = struct {
     stdout_is_fd: bool = false,
     stdout_dead: bool = false, // EPIPE: the IDE is gone; drop queued output
 
+    // ---- Windows stdio relay (libuv pattern for non-overlappable IDE
+    // pipes — see win_stdio comment on attachStdio) ----
+    stdin_relay: StdinRelay = .{},
+    stdout_relay: StdoutRelay = .{},
+
     // ---- transport ----
     mode: TransportMode = .streamable,
     probed: bool = false,
@@ -216,8 +221,13 @@ pub const Bridge = struct {
             conn.deinitMem();
         }
         self.conns.deinit(self.alloc);
-        self.stdin_carry.deinit(self.alloc);
-        self.stdout_q.deinit(self.alloc);
+        if (platform.is_windows) {
+            // Relay buffers are shared with the (unjoined, blocked) stdin
+            // reader thread; the process is exiting — leave them.
+        } else {
+            self.stdin_carry.deinit(self.alloc);
+            self.stdout_q.deinit(self.alloc);
+        }
         if (self.session_id) |sid| self.alloc.free(sid);
         if (self.leg_endpoint_url) |u| self.alloc.free(u);
         if (self.leg_last_event_id) |i| self.alloc.free(i);
@@ -232,16 +242,133 @@ pub const Bridge = struct {
 
     // ---------------------------------------------------------- stdio ----
 
-    /// Production: stdin non-blocking + registered; stdout non-blocking +
-    /// queued writes. (POSIX; the Windows overlapped path lands with the
-    /// IOCP backend.)
+    /// Windows stdio relay state (unused on POSIX). IDE-spawned anonymous
+    /// pipes can't do overlapped I/O, so a reader thread posts stdin chunks
+    /// into the loop's IOCP and a writer thread drains the stdout queue —
+    /// the libuv pattern; the loop itself is always completion-driven.
+    pub const StdinRelay = struct {
+        mutex: std.Thread.Mutex = .{},
+        buf: std.ArrayList(u8) = .empty,
+        eof: bool = false,
+        thread: ?std.Thread = null,
+    };
+
+    pub const StdoutRelay = struct {
+        mutex: std.Thread.Mutex = .{},
+        queue: std.ArrayList(u8) = .empty,
+        event: ?@import("win.zig").HANDLE = null, // auto-reset wakeup
+        quit: bool = false,
+        dead: bool = false, // EPIPE: the IDE is gone
+        thread: ?std.Thread = null,
+    };
+
+    /// Production: wire up stdin + stdout for the loop.
+    /// POSIX: non-blocking fds registered on the event port.
+    /// Windows: relay threads (above) — nothing here blocks the loop.
     pub fn attachStdio(self: *Bridge) void {
-        if (platform.is_windows) return;
+        if (platform.is_windows) {
+            self.attachStdioWin();
+            return;
+        }
         setNonBlocking(std.posix.STDIN_FILENO);
         setNonBlocking(std.posix.STDOUT_FILENO);
         self.evp.monitorRead(std.posix.STDIN_FILENO, @as(?*anyopaque, &stdin_sentinel));
         self.stdin_active = true;
         self.stdout_is_fd = true;
+    }
+
+    fn attachStdioWin(self: *Bridge) void {
+        const win = @import("win.zig");
+        const stdout_h = win.GetStdHandle(win.STD_OUTPUT_HANDLE);
+        if (stdout_h != null and win.GetFileType(stdout_h.?) == win.FILE_TYPE_PIPE) {
+            // Stdout writer relay: event-signaled queue drained by blocking
+            // WriteFile off the loop thread.
+            self.stdout_relay.event = win.CreateEventExW(null, null, 0, 0x1F0003); // EVENT_ALL_ACCESS
+            if (self.stdout_relay.event != null) {
+                self.stdout_relay.thread = std.Thread.spawn(.{}, stdoutWriterMain, .{self}) catch null;
+                self.stdout_is_fd = self.stdout_relay.thread != null;
+            }
+        }
+        const stdin_h = win.GetStdHandle(win.STD_INPUT_HANDLE);
+        if (stdin_h == null) return;
+        if (win.GetFileType(stdin_h.?) != win.FILE_TYPE_PIPE) return; // console: manual OAuth runs have no loop stdin
+        self.stdin_relay.thread = std.Thread.spawn(.{}, stdinReaderMain, .{self}) catch null;
+        self.stdin_active = self.stdin_relay.thread != null;
+    }
+
+    /// stdin relay thread: blocking ReadFile on the sync pipe → mailbox +
+    /// completion post into the loop's IOCP. Exits on EOF/read error.
+    fn stdinReaderMain(self: *Bridge) void {
+        const win = @import("win.zig");
+        const h = win.GetStdHandle(win.STD_INPUT_HANDLE).?;
+        var tmp: [4096]u8 = undefined;
+        while (true) {
+            var n: u32 = 0;
+            const ok = win.ReadFile(h, &tmp, tmp.len, &n, null);
+            self.stdin_relay.mutex.lock();
+            if (ok == 0 or n == 0) {
+                self.stdin_relay.eof = true;
+                self.stdin_relay.mutex.unlock();
+                self.evp.post(@as(*anyopaque, @constCast(&stdin_sentinel)), null, 0);
+                return;
+            }
+            self.stdin_relay.buf.appendSlice(self.alloc, tmp[0..n]) catch {};
+            self.stdin_relay.mutex.unlock();
+            self.evp.post(@as(*anyopaque, @constCast(&stdin_sentinel)), null, n);
+        }
+    }
+
+    /// stdout relay thread: wait on the event, drain the queue via blocking
+    /// WriteFile. EPIPE/closed stdout ends the thread.
+    fn stdoutWriterMain(self: *Bridge) void {
+        const win = @import("win.zig");
+        const h = win.GetStdHandle(win.STD_OUTPUT_HANDLE).?;
+        const r = &self.stdout_relay;
+        while (true) {
+            _ = std.os.windows.WaitForSingleObject(r.event.?, win.INFINITE) catch {};
+            r.mutex.lock();
+            if (r.quit and r.queue.items.len == 0) {
+                r.mutex.unlock();
+                return;
+            }
+            const chunk = r.queue.toOwnedSlice(self.alloc) catch {
+                r.mutex.unlock();
+                continue;
+            };
+            r.mutex.unlock();
+            var off: usize = 0;
+            var failed = false;
+            while (off < chunk.len) {
+                var n: u32 = 0;
+                if (win.WriteFile(h, chunk.ptr + off, @intCast(chunk.len - off), &n, null) == 0) {
+                    failed = true;
+                    break;
+                }
+                off += n;
+            }
+            self.alloc.free(chunk);
+            if (failed) {
+                r.mutex.lock();
+                r.dead = true;
+                r.mutex.unlock();
+                return;
+            }
+        }
+    }
+
+    /// Process exit teardown for the relays: the stdin reader may sit in a
+    /// blocking ReadFile — it dies with the process. The writer is signaled
+    /// and joined (its queue is already drained: isDone waited for it).
+    pub fn shutdownStdio(self: *Bridge) void {
+        if (!platform.is_windows) return;
+        if (self.stdout_relay.thread) |th| {
+            self.stdout_relay.mutex.lock();
+            self.stdout_relay.quit = true;
+            self.stdout_relay.mutex.unlock();
+            _ = @import("win.zig").SetEvent(self.stdout_relay.event.?);
+            th.join();
+        }
+        // stdin reader: left blocked in ReadFile; ExitProcess reaps it.
     }
 
     fn setNonBlocking(fd: std.posix.fd_t) void {
@@ -252,7 +379,16 @@ pub const Bridge = struct {
     }
 
     fn queueStdout(self: *Bridge, bytes: []const u8) void {
-        if (!self.stdout_is_fd or self.stdout_dead) return;
+        if (!self.stdout_is_fd) return;
+        if (platform.is_windows) {
+            const r = &self.stdout_relay;
+            r.mutex.lock();
+            if (!r.dead) r.queue.appendSlice(self.alloc, bytes) catch {};
+            r.mutex.unlock();
+            if (r.event) |ev| _ = @import("win.zig").SetEvent(ev);
+            return;
+        }
+        if (self.stdout_dead) return;
         self.stdout_q.appendSlice(self.alloc, bytes) catch {};
         self.evp.wantWrite(std.posix.STDOUT_FILENO, @as(?*anyopaque, &stdout_sentinel));
     }
@@ -268,6 +404,10 @@ pub const Bridge = struct {
     }
 
     fn onStdoutWritable(self: *Bridge) void {
+        if (!platform.is_windows) self.onStdoutWritablePosix(); // windows: writer relay
+    }
+
+    fn onStdoutWritablePosix(self: *Bridge) void {
         while (self.stdout_q.items.len > 0) {
             const n = std.posix.write(std.posix.STDOUT_FILENO, self.stdout_q.items) catch |err| switch (err) {
                 error.WouldBlock => {
@@ -294,6 +434,14 @@ pub const Bridge = struct {
 
     /// Stdin readable: drain to EAGAIN, split complete lines, dispatch.
     fn onStdinReadable(self: *Bridge) void {
+        if (platform.is_windows) {
+            self.onStdinReadableRelay();
+        } else {
+            self.onStdinReadablePosix();
+        }
+    }
+
+    fn onStdinReadablePosix(self: *Bridge) void {
         var tmp: [16384]u8 = undefined;
         while (true) {
             const n = std.posix.read(std.posix.STDIN_FILENO, &tmp) catch |err| switch (err) {
@@ -308,19 +456,39 @@ pub const Bridge = struct {
                 return;
             }
             self.stdin_carry.appendSlice(self.alloc, tmp[0..n]) catch {};
-            while (std.mem.indexOfScalar(u8, self.stdin_carry.items, '\n')) |nl| {
-                var line = self.stdin_carry.items[0..nl];
-                if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-                const owned = self.alloc.dupe(u8, line) catch null;
-                const rest = self.stdin_carry.items.len - (nl + 1);
-                std.mem.copyForwards(u8, self.stdin_carry.items[0..rest], self.stdin_carry.items[nl + 1 ..]);
-                self.stdin_carry.items.len = rest;
-                if (owned) |l| {
-                    defer self.alloc.free(l);
-                    if (l.len > 0) self.handleLine(l);
-                }
-                if (self.stdin_eof) return; // shutdown began mid-batch
+            self.splitLines();
+            if (self.stdin_eof) return; // shutdown began mid-batch
+        }
+    }
+
+    /// Windows: drain the relay mailbox, split complete lines, dispatch.
+    fn onStdinReadableRelay(self: *Bridge) void {
+        const r = &self.stdin_relay;
+        r.mutex.lock();
+        const eof = r.eof;
+        if (r.buf.items.len > 0) {
+            self.stdin_carry.appendSlice(self.alloc, r.buf.items) catch {};
+            r.buf.clearRetainingCapacity();
+        }
+        r.mutex.unlock();
+        self.splitLines();
+        if (eof and !self.stdin_eof) self.onStdinEof();
+    }
+
+    /// Extract complete lines from stdin_carry and dispatch them.
+    fn splitLines(self: *Bridge) void {
+        while (std.mem.indexOfScalar(u8, self.stdin_carry.items, '\n')) |nl| {
+            var line = self.stdin_carry.items[0..nl];
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            const owned = self.alloc.dupe(u8, line) catch null;
+            const rest = self.stdin_carry.items.len - (nl + 1);
+            std.mem.copyForwards(u8, self.stdin_carry.items[0..rest], self.stdin_carry.items[nl + 1 ..]);
+            self.stdin_carry.items.len = rest;
+            if (owned) |l| {
+                defer self.alloc.free(l);
+                if (l.len > 0) self.handleLine(l);
             }
+            if (self.stdin_eof) return; // shutdown began mid-batch
         }
     }
 
@@ -370,7 +538,13 @@ pub const Bridge = struct {
             }
             if (ev.udata) |ud| {
                 const conn: *httpc.Conn = @ptrCast(@alignCast(ud));
-                if (!conn.closing) conn.onEvent(ev);
+                if (!conn.closing) {
+                    conn.onEvent(ev);
+                } else if (platform.is_windows) {
+                    // IOCP teardown: completions for cancelled ops still
+                    // arrive — absorb them quietly so the pendings drain.
+                    conn.absorbCompletion(ev);
+                }
             }
         }
         self.reap();
@@ -382,11 +556,21 @@ pub const Bridge = struct {
         while (!self.isDone()) try self.step(null);
     }
 
-    fn isDone(self: *const Bridge) bool {
+    fn isDone(self: *Bridge) bool {
         if (!self.shutting_down) return false;
         if (self.conns.items.len != 0) return false;
-        if (self.stdout_q.items.len != 0 and !self.stdout_dead) return false;
+        if (!self.stdoutDrained()) return false;
         return true;
+    }
+
+    fn stdoutDrained(self: *Bridge) bool {
+        if (platform.is_windows) {
+            const r = &self.stdout_relay;
+            r.mutex.lock();
+            defer r.mutex.unlock();
+            return r.queue.items.len == 0;
+        }
+        return self.stdout_q.items.len == 0 or self.stdout_dead;
     }
 
     /// End-of-batch reap: close + free every closing-marked conn.
@@ -404,8 +588,17 @@ pub const Bridge = struct {
                 i += 1;
                 continue;
             }
-            self.evp.purgeFd(conn.fd());
-            conn.reapClose(); // closeNotify + free TLS state + close fd
+            if (!conn.reap_closed) {
+                self.evp.purgeFd(conn.fd());
+                conn.reapClose(); // closeNotify + cancel + close fd/socket
+                conn.reap_closed = true;
+            }
+            // IOCP: OVERLAPPED memory must outlive the ops' completions;
+            // they arrive aborted and drain the count within a step or two.
+            if (conn.stream.pendingOps() != 0) {
+                i += 1;
+                continue;
+            }
             if (self.idle_conn == conn) self.idle_conn = null;
             if (self.leg_conn == conn) self.leg_conn = null;
             if (self.push_conn == conn) self.push_conn = null;
@@ -1742,6 +1935,7 @@ pub fn main() !void {
 
     if (cfg.verbose) std.debug.print("mcp-bridge: event loop starting\n", .{});
     try bridge.run();
+    bridge.shutdownStdio();
 
     if (bridge.fatal) |err| return err;
     if (cfg.verbose) std.debug.print("mcp-bridge: stdin closed, exiting\n", .{});

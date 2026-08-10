@@ -35,7 +35,10 @@ pub const Stream = union(enum) {
     }
 
     /// Start a non-blocking TCP connect (all conns begin as .plain).
-    pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) PlainNb.Error!Stream {
+    /// The evp/key params are the Windows (IOCP) association — unused here.
+    pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16, evp: anytype, key: ?*anyopaque) PlainNb.Error!Stream {
+        _ = evp;
+        _ = key;
         return .{ .plain = try PlainNb.startConnect(alloc, host, port) };
     }
 
@@ -48,7 +51,8 @@ pub const Stream = union(enum) {
     }
 
     /// Replace the plain variant with a TLS client on the same fd.
-    pub fn swapToTls(self: *Stream, host: []const u8) tls_openssl.TlsError!void {
+    pub fn swapToTls(self: *Stream, alloc: std.mem.Allocator, host: []const u8) tls_openssl.TlsError!void {
+        _ = alloc;
         const sock = switch (self.*) {
             .plain => |*s| s.sock,
             .tls => unreachable,
@@ -110,6 +114,12 @@ pub const Stream = union(enum) {
             .plain => {},
             .tls => |*s| s.closeNotify(),
         }
+    }
+
+    /// In-flight op count — always zero on POSIX (no deferred reap drain).
+    pub fn pendingOps(self: *const Stream) usize {
+        _ = self;
+        return 0;
     }
 
     /// Frees TLS state (if any) and closes the fd.

@@ -248,10 +248,11 @@ pub const Conn = struct {
 
     stream: nb.Stream = undefined,
     state: State = .connecting,
-    /// Marked by close(); the core closes the fd at the reap point and
-    /// frees the conn after the batch. Handlers must not touch a conn
-    /// after calling close().
+    /// Marked by close(); the core reaps at end of batch.
     closing: bool = false,
+    /// The core's reap already cancelled/closed the stream (IOCP: pending
+    /// op completions may still arrive and are absorbed quietly).
+    reap_closed: bool = false,
 
     // ---- write side ----
     wq: std.ArrayList(u8) = .empty, // request bytes
@@ -337,11 +338,12 @@ pub const Conn = struct {
         };
         errdefer conn.deinitMem();
 
-        conn.stream = nb.Stream.startConnect(alloc, target.host, target.port) catch return Error.ConnectFailed;
+        conn.stream = nb.Stream.startConnect(alloc, target.host, target.port, evp, conn) catch return Error.ConnectFailed;
 
         // Persistent edge-triggered read interest for the conn's whole
         // life; one-shot write interest for connect completion (the event
-        // port dedups write arms).
+        // port dedups write arms). On IOCP these are the association +
+        // in-flight connect posted inside startConnect.
         evp.monitorRead(conn.stream.fd(), conn);
         evp.wantWrite(conn.stream.fd(), conn);
         return conn;
@@ -351,8 +353,10 @@ pub const Conn = struct {
         return self.stream.fd();
     }
 
-    /// Mark the conn closing. No syscalls here: the core's reap closes the
-    /// fd after the next wait() flush, then frees the conn.
+    /// Mark the conn closing. No teardown here: the core's end-of-batch
+    /// reap purges staged registrations (kqueue), cancels in-flight ops
+    /// (IOCP), closes the fd/socket, and frees the conn once drained.
+    /// Handlers must not touch a conn after calling close().
     pub fn close(self: *Conn) void {
         self.closing = true;
     }
@@ -440,6 +444,11 @@ pub const Conn = struct {
 
     pub fn onEvent(self: *Conn, ev: evport.Event) void {
         if (self.closing) return;
+        if (platform.is_windows) {
+            self.absorbCompletion(ev);
+            if (!self.closing) self.drive();
+            return;
+        }
         if (ev.readable) self.read_ready = true;
         if (ev.writable) self.write_ready = true;
         if (ev.err) {
@@ -449,6 +458,18 @@ pub const Conn = struct {
             self.write_ready = true;
         }
         self.drive();
+    }
+
+    /// IOCP: classify the completion by OVERLAPPED address and update the
+    /// stream's ready state. Also the closing-conn drain path (reap waits
+    /// for pending ops to complete before freeing the OVERLAPPED memory).
+    pub fn absorbCompletion(self: *Conn, ev: evport.Event) void {
+        const kind = self.stream.absorbCompletion(ev.overlapped, ev.bytes, if (ev.err) ev.err_no else null);
+        switch (kind) {
+            .recv => self.read_ready = true,
+            .send, .connect => self.write_ready = true,
+            .unknown => {},
+        }
     }
 
     /// Make progress while possible without blocking. Re-entrant safe per
@@ -479,7 +500,7 @@ pub const Conn = struct {
             self.state = .writing;
             return true;
         }
-        self.stream.swapToTls(self.target.host) catch {
+        self.stream.swapToTls(self.alloc, self.target.host) catch {
             self.fail(error.HandshakeFailed);
             return true;
         };
@@ -629,8 +650,8 @@ pub const Conn = struct {
         while (self.read_ready) {
             const r = self.stream.readNb(&tmp) catch |err| {
                 self.fail(switch (err) {
-                    nb.IoError.SocketError => error.SocketError,
-                    nb.IoError.TlsError => error.TlsError,
+                    error.TlsError => error.TlsError,
+                    else => error.SocketError,
                 });
                 return true;
             };
