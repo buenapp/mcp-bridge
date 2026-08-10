@@ -27,6 +27,8 @@ comptime {
         _ = @import("httpc.zig");
         _ = @import("syncreq.zig");
         _ = @import("test_httpc.zig");
+        _ = @import("oauth_loopback.zig");
+        _ = @import("oauth_lock.zig");
     }
 }
 

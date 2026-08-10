@@ -179,6 +179,13 @@ enables it), the bridge runs OAuth automatically:
    (`~/.local/share/mcp-bridge/tokens/`, `%LOCALAPPDATA%\mcp-bridge\tokens\`,
    mode 0600) and refreshed automatically; you authorize once per server.
 
+**Concurrent instances (POSIX).** Two IDE windows spawning the bridge for
+the same server at the same time coordinate through a lock file in the
+token cache dir: the second instance waits on the first one's loopback
+listener and adopts its freshly cached tokens instead of opening a
+duplicate browser tab. Stale locks (dead process) are taken over
+automatically. Windows skips this, matching mcp-remote.
+
 ### Remote SSH sessions
 
 Over VS Code / Windsurf Remote SSH the flow behaves as if local: the IDE

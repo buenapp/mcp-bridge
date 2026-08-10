@@ -35,6 +35,7 @@ const sse = @import("sse.zig");
 const oauth = @import("oauth.zig");
 const pkce = @import("pkce.zig");
 const loopback = @import("oauth_loopback.zig");
+const oauth_lock = @import("oauth_lock.zig");
 const config_file = @import("config.zig");
 const evport = @import("evport.zig");
 const httpc = @import("httpc.zig");
@@ -1662,6 +1663,57 @@ pub const Bridge = struct {
 
         var listener = try loopback.Listener.init(180_000);
         defer listener.deinit();
+        // Held /wait-for-auth pollers get EOF on any failure exit (no-op
+        // once completeWaiters has run).
+        defer listener.dropWaiters();
+
+        // Multi-instance coordination (POSIX, issue #3): when another
+        // mcp-bridge instance is mid-flow for the same server, wait for it
+        // and adopt the tokens it caches instead of opening a second
+        // browser tab. Windows skips this (mcp-remote parity).
+        var lock: ?oauth_lock.Lock = null;
+        defer if (lock) |*l| l.release(alloc);
+        if (comptime oauth_lock.is_supported) {
+            var waits: u8 = 0;
+            while (lock == null) {
+                const ar = oauth_lock.acquire(alloc, self.cfg.url, self.cacheResource(), listener.port) catch |err| {
+                    log.err("oauth lockfile: {s}", .{@errorName(err)});
+                    return err;
+                };
+                switch (ar) {
+                    .acquired => |l| lock = l,
+                    .held_by_other => |peer_port| {
+                        waits += 1;
+                        if (waits > 4) {
+                            log.err("oauth lockfile: coordinating instance keeps failing", .{});
+                            return error.OAuthLockContention;
+                        }
+                        if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] another instance is authenticating; waiting for it\n", .{});
+                        if (loopback.waitForAuth(peer_port, 180_000) == .done) {
+                            if (oauth.loadTokenCache(alloc, self.cfg.url, self.cacheResource()) catch null) |t| {
+                                if (!t.isExpired(std.time.timestamp())) {
+                                    self.adoptTokens(t);
+                                    std.debug.print("mcp-bridge: [oauth] authorization completed by another instance, token adopted\n", .{});
+                                    return;
+                                }
+                            }
+                        }
+                        // Peer's flow failed or its tokens are unusable:
+                        // loop and take over (its lock is released or stale).
+                    },
+                }
+            }
+            // We hold the lock — but another instance may have COMPLETED
+            // its flow between our startup cache check and the acquisition.
+            if (oauth.loadTokenCache(alloc, self.cfg.url, self.cacheResource()) catch null) |t| {
+                if (!t.isExpired(std.time.timestamp())) {
+                    self.adoptTokens(t);
+                    if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] tokens appeared while acquiring the lock; adopted\n", .{});
+                    return;
+                }
+            }
+        }
+
         const redirect_uri = try listener.redirectUri(alloc);
         defer alloc.free(redirect_uri);
 
@@ -1709,6 +1761,8 @@ pub const Bridge = struct {
         t.client_id = try alloc.dupe(u8, client_id);
         self.adoptTokens(t);
         try oauth.saveTokenCache(alloc, self.cfg.url, self.cacheResource(), self.tokens.?);
+        // Tokens are on disk — NOW release the waiting second instances.
+        listener.completeWaiters();
         std.debug.print("mcp-bridge: [oauth] authorization complete, token cached\n", .{});
     }
 

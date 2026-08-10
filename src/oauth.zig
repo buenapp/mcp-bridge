@@ -239,10 +239,10 @@ pub fn tokensDir(alloc: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, ".local", "share", "mcp-bridge", "tokens" });
 }
 
-/// Cache file path for a server URL: <tokens_dir>/<sha256hex>.json
-/// The hash input is the server URL alone when no explicit resource is
-/// configured (preserving pre-resource cache files), else "url\nresource".
-pub fn tokenPath(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8) ![]u8 {
+/// Cache key (sha256 hex) for a server URL. The hash input is the server
+/// URL alone when no explicit resource is configured (preserving
+/// pre-resource cache files), else "url\nresource".
+fn cacheKeyHex(server_url: []const u8, resource: ?[]const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     if (resource) |r| {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
@@ -259,9 +259,31 @@ pub fn tokenPath(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]
         hex[i * 2] = chars[b >> 4];
         hex[i * 2 + 1] = chars[b & 0xf];
     }
+    return hex;
+}
+
+pub fn pathInDir(alloc: std.mem.Allocator, dir: []const u8, server_url: []const u8, resource: ?[]const u8, suffix: []const u8) ![]u8 {
+    const hex = cacheKeyHex(server_url, resource);
+    return std.fmt.allocPrint(alloc, "{s}" ++ std.fs.path.sep_str ++ "{s}{s}", .{ dir, hex, suffix });
+}
+
+/// Cache file path for a server URL: <tokens_dir>/<sha256hex>.json
+pub fn tokenPath(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8) ![]u8 {
     const dir = try tokensDir(alloc);
     defer alloc.free(dir);
-    return std.fmt.allocPrint(alloc, "{s}" ++ std.fs.path.sep_str ++ "{s}.json", .{ dir, hex });
+    return pathInDir(alloc, dir, server_url, resource, ".json");
+}
+
+/// Coordination lock file for concurrent interactive flows (issue #3):
+/// <dir>/<sha256hex>_lock.json — the same cache key as the token file.
+pub fn lockPathIn(alloc: std.mem.Allocator, dir: []const u8, server_url: []const u8, resource: ?[]const u8) ![]u8 {
+    return pathInDir(alloc, dir, server_url, resource, "_lock.json");
+}
+
+pub fn lockPath(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8) ![]u8 {
+    const dir = try tokensDir(alloc);
+    defer alloc.free(dir);
+    return lockPathIn(alloc, dir, server_url, resource);
 }
 
 /// Load a cached token set. Returns null when absent or unparsable.

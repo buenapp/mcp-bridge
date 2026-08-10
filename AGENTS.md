@@ -10,6 +10,11 @@
   - Release builds: `zig0152 build -Dtarget=x86_64-{freebsd,windows-gnu,linux-gnu} -Doptimize=ReleaseSafe`
 - Linux test binary cross-build (for the VMs): see git log / Heliofane
   McpBridge notes.
+- Multi-process live test for the OAuth lockfile coordination (issue #3):
+  build the native binary first (`zig0152 build -Dtarget=x86_64-freebsd`),
+  then `python3 tests/live_oauth_lock.py` (needs openssl + curl; spins a
+  local HTTPS mock AS with a throwaway CA via SSL_CERT_FILE and races two
+  bridge processes on a shared token cache).
 
 ## Architecture (post issue #7 rework)
 - Single event loop over src/evport.zig (kqueue FreeBSD / epoll Linux /
