@@ -1,10 +1,8 @@
 # McpBridge
 
-> **Status: pre-release.** All releases and tags were withdrawn on
-> 2026-08-09. The I/O core is being reworked to a fully event-driven
-> design (kqueue/epoll/IOCP); no new release will be tagged until that
-> lands. Track issue
-> [#7](https://pacyworld.dev/buenapp/mcp-bridge/issues/7).
+> The I/O core is fully event-driven (kqueue on FreeBSD, epoll on Linux,
+> IOCP on Windows): one dispatch loop, no blocking I/O on the data path.
+
 
 <img src="assets/icon.svg" align="right" width="128" alt="MCP Bridge icon">
 
