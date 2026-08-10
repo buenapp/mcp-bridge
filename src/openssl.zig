@@ -13,6 +13,7 @@ pub const c = @cImport({
     @cInclude("openssl/x509.h");
     @cInclude("openssl/x509_vfy.h");
     @cInclude("openssl/x509v3.h");
+    @cInclude("openssl/pem.h");
 });
 
 pub const OsslError = error{

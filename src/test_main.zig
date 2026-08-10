@@ -17,9 +17,13 @@ comptime {
     _ = sse;
     _ = evport;
     _ = test_transport;
-    // Backend tests live in the per-platform files; reference the one for
-    // this host so its tests are discovered.
+    // Backend tests live in the per-platform files; reference the ones for
+    // this host so their tests are discovered.
     if (builtin.os.tag == .freebsd) _ = @import("evport_kqueue.zig");
+    if (builtin.os.tag != .windows) {
+        _ = @import("posix.zig");
+        _ = @import("tls_openssl.zig");
+    }
 }
 
 fn spkiStub(alloc: std.mem.Allocator, cert_der: []const u8) anyerror![]u8 {
