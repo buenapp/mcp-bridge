@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const http = @import("http.zig");
+const syncreq = @import("syncreq.zig");
 
 const log = std.log.scoped(.oauth);
 
@@ -337,7 +338,8 @@ pub fn deleteTokenCache(alloc: std.mem.Allocator, server_url: []const u8, resour
 // ---------------------------------------------------------------- transport --
 
 /// One-shot HTTPS request to an arbitrary URL (own connection, own
-/// verifier). Returns an owned http.Response.
+/// verifier). Runs on a private event port via syncreq — no blocking
+/// socket I/O. Returns an owned http.Response.
 fn request(
     alloc: std.mem.Allocator,
     method: enum { get, post_form, post_json },
@@ -348,13 +350,10 @@ fn request(
     if (!t.secure) return OAuthError.DiscoveryFailed; // OAuth requires TLS
 
     var verifier = try platform.Verifier.init(alloc, t.host, t.port, verbose);
-    var tls = try platform.connectTls(alloc, t.host, t.port, &verifier);
-    defer tls.deinit();
-
     return switch (method) {
-        .get => try http.get(alloc, &tls, t.host, t.path, &.{}),
-        .post_form => try http.postWith(alloc, &tls, t.host, t.path, body.?, "application/x-www-form-urlencoded", &.{}, null, .{}),
-        .post_json => try http.postWith(alloc, &tls, t.host, t.path, body.?, "application/json", &.{}, null, .{}),
+        .get => try syncreq.request(alloc, "GET", t, "application/json", null, &.{}, null, &verifier),
+        .post_form => try syncreq.request(alloc, "POST", t, "application/json", "application/x-www-form-urlencoded", &.{}, body.?, &verifier),
+        .post_json => try syncreq.request(alloc, "POST", t, "application/json", "application/json", &.{}, body.?, &verifier),
     };
 }
 

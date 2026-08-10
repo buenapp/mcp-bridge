@@ -1,0 +1,122 @@
+// POSIX non-blocking stream union for the event core (issue #7): plain TCP
+// and OpenSSL TLS over one fd, with a uniform surface for httpc.zig.
+// TLS wraps the socket after the TCP connect completes (stream.swapToTls).
+//
+// Ownership: the Stream owns its fd; deinit closes it (TLS variant after
+// freeing OpenSSL state). The event core calls deinit at the reap point.
+
+const std = @import("std");
+const posix = @import("posix.zig");
+const tls_openssl = @import("tls_openssl.zig");
+const platform = @import("platform.zig");
+const openssl = @import("openssl.zig");
+
+pub const PlainNb = posix.PlainNb;
+pub const TlsNb = tls_openssl.TlsNb;
+pub const NbRead = posix.NbRead;
+pub const NbWrite = posix.NbWrite;
+pub const Drive = tls_openssl.Drive;
+pub const Fd = std.posix.fd_t;
+
+pub const IoError = error{
+    SocketError,
+    TlsError,
+};
+
+pub const Stream = union(enum) {
+    plain: PlainNb,
+    tls: TlsNb,
+
+    pub fn fd(self: *const Stream) std.posix.fd_t {
+        return switch (self.*) {
+            .plain => |*s| s.sock,
+            .tls => |*s| s.sock,
+        };
+    }
+
+    /// Start a non-blocking TCP connect (all conns begin as .plain).
+    pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) PlainNb.Error!Stream {
+        return .{ .plain = try PlainNb.startConnect(alloc, host, port) };
+    }
+
+    /// Confirm the connect after the first write event (SO_ERROR).
+    pub fn connectDone(self: *Stream) PlainNb.Error!void {
+        return switch (self.*) {
+            .plain => |*s| s.connectDone(),
+            .tls => unreachable, // connect only completes in the plain phase
+        };
+    }
+
+    /// Replace the plain variant with a TLS client on the same fd.
+    pub fn swapToTls(self: *Stream, host: []const u8) tls_openssl.TlsError!void {
+        const sock = switch (self.*) {
+            .plain => |*s| s.sock,
+            .tls => unreachable,
+        };
+        self.* = .{ .tls = try TlsNb.initOnSocket(sock, host) };
+    }
+
+    /// Drive the TLS handshake; plain streams are done by definition.
+    pub fn handshakeDrive(self: *Stream) tls_openssl.TlsError!Drive {
+        return switch (self.*) {
+            .plain => .done,
+            .tls => |*s| s.handshakeDrive(),
+        };
+    }
+
+    /// DANE/PKI verify hook after a completed TLS handshake. Synchronous
+    /// (TLSA lookup is cached in the Verifier); runs on the loop thread at
+    /// connection setup, never on the data path.
+    pub fn verifyPeer(self: *Stream, v: *platform.Verifier) bool {
+        return switch (self.*) {
+            .plain => true,
+            .tls => |*s| {
+                const ssl = s.ssl orelse return false;
+                if (openssl.c.SSL_get0_peer_certificate(ssl) == null) return false;
+                return platform.Verifier.verifyOpaque(v, ssl);
+            },
+        };
+    }
+
+    pub fn readNb(self: *Stream, out: []u8) IoError!NbRead {
+        return switch (self.*) {
+            .plain => |*s| s.readNb(out) catch |err| switch (err) {
+                error.SocketError => IoError.SocketError,
+                else => unreachable,
+            },
+            .tls => |*s| s.readNb(out) catch |err| switch (err) {
+                error.TlsError => IoError.TlsError,
+                else => unreachable,
+            },
+        };
+    }
+
+    pub fn writeNb(self: *Stream, data: []const u8) IoError!NbWrite {
+        return switch (self.*) {
+            .plain => |*s| s.writeNb(data) catch |err| switch (err) {
+                error.SocketError => IoError.SocketError,
+                else => unreachable,
+            },
+            .tls => |*s| s.writeNb(data) catch |err| switch (err) {
+                error.TlsError => IoError.TlsError,
+                else => unreachable,
+            },
+        };
+    }
+
+    /// Best-effort TLS close_notify (plain: no-op).
+    pub fn closeNotify(self: *Stream) void {
+        switch (self.*) {
+            .plain => {},
+            .tls => |*s| s.closeNotify(),
+        }
+    }
+
+    /// Frees TLS state (if any) and closes the fd.
+    pub fn deinit(self: *Stream) void {
+        switch (self.*) {
+            .plain => |*s| s.deinit(),
+            .tls => |*s| s.deinit(),
+        }
+    }
+};

@@ -292,9 +292,9 @@ pub const TlsNb = struct {
     pub fn deinit(self: *TlsNb) void {
         if (self.ssl) |s| c.SSL_free(s);
         if (self.ctx) |x| c.SSL_CTX_free(x);
+        if (self.sock >= 0) std.posix.close(self.sock);
         self.ssl = null;
         self.ctx = null;
-        // Socket ownership stays with the caller (conn closes it at reap).
         self.sock = -1;
     }
 };
@@ -396,14 +396,15 @@ const TestServer = struct {
     fn deinit(self: *TestServer) void {
         if (self.ssl) |s| c.SSL_free(s);
         if (self.ctx) |x| c.SSL_CTX_free(x);
+        // fd closed by the test
     }
 };
 
 test "TlsNb: non-blocking handshake interlock + encrypted echo" {
     var fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0, &fds));
-    defer _ = std.c.close(fds[0]);
-    defer _ = std.c.close(fds[1]);
+    defer _ = std.c.close(fds[0]); // server end (TestServer borrows)
+    // client end owned/closed by TlsNb.deinit
 
     var server = try TestServer.init(fds[0]);
     defer server.deinit();

@@ -23,6 +23,9 @@ comptime {
     if (builtin.os.tag != .windows) {
         _ = @import("posix.zig");
         _ = @import("tls_openssl.zig");
+        _ = @import("httpc.zig");
+        _ = @import("syncreq.zig");
+        _ = @import("test_httpc.zig");
     }
 }
 

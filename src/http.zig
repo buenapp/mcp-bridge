@@ -174,7 +174,7 @@ pub fn delete(
     resp.deinit(alloc);
 }
 
-const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 
 fn appendFmt(alloc: std.mem.Allocator, list: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(alloc, fmt, args);
@@ -533,7 +533,7 @@ pub fn openSseStream(
     return stream;
 }
 
-fn getHeaderValue(head: []const u8, name: []const u8) ?[]const u8 {
+pub fn getHeaderValue(head: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, head, "\r\n");
     _ = it.next(); // skip status line
     while (it.next()) |line| {
@@ -546,7 +546,7 @@ fn getHeaderValue(head: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn getHeaderNumeric(head: []const u8, name: []const u8) ?usize {
+pub fn getHeaderNumeric(head: []const u8, name: []const u8) ?usize {
     const v = getHeaderValue(head, name) orelse return null;
     return std.fmt.parseInt(usize, v, 10) catch null;
 }
