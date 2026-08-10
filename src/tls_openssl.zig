@@ -161,30 +161,40 @@ pub const TlsNb = struct {
 
 // --------------------------------------------------------------- tests ----
 
-// Throwaway test-only self-signed cert (CN=localhost, EC prime256v1,
-// generated 2026-08-09, expires 2036). Never used outside this test.
-const test_cert_pem =
-    \\-----BEGIN CERTIFICATE-----
-    \\MIIBfTCCASOgAwIBAgIUUY11E6+WhJQ0XL6QoRSb3neZUGUwCgYIKoZIzj0EAwIw
-    \\FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgwOTIzNTQzM1oXDTM2MDgwNjIz
-    \\NTQzM1owFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
-    \\AQcDQgAEEkzYGSQ9B5br1QvgjqLG4rQtlMb8XWgISMrtlizNstg8A/IoJlwPLpYG
-    \\10l19kYpXAm4s3YpdZ8bXnjhv/CaGKNTMFEwHQYDVR0OBBYEFKq2gGln6b2/bFBY
-    \\h5DmNT40iuJ3MB8GA1UdIwQYMBaAFKq2gGln6b2/bFBYh5DmNT40iuJ3MA8GA1Ud
-    \\EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhANfTgUCxghaH29aFg5wrQ1Yb
-    \\3XI2ZZGfi56+NNJCHjURAiB7sx/6uyLsBk8tUkkeAC2vOyepiFRVOzdKJYgJvXda
-    \\WQ==
-    \\-----END CERTIFICATE-----
-    \\
-;
-const test_key_pem =
-    \\-----BEGIN TEST FIXTURE-----
-    \\REDACTED-TEST-ONLY
-    \\REDACTED-TEST-ONLY
-    \\REDACTED-TEST-ONLY
-    \\-----END TEST FIXTURE-----
-    \\
-;
+/// The interlock test's keypair is GENERATED at test time — no PEM
+/// fixtures in the repo (secret scanners reject embedded keys, rightly).
+const TestPki = struct {
+    key: *c.EVP_PKEY,
+    cert: *c.X509,
+};
+
+fn generateTestPki() ?TestPki {
+    const kctx = c.EVP_PKEY_CTX_new_id(c.EVP_PKEY_EC, null) orelse return null;
+    defer c.EVP_PKEY_CTX_free(kctx);
+    if (c.EVP_PKEY_keygen_init(kctx) <= 0) return null;
+    if (c.EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx, c.NID_X9_62_prime256v1) <= 0) return null;
+    var pkey: ?*c.EVP_PKEY = null;
+    if (c.EVP_PKEY_keygen(kctx, &pkey) <= 0) return null;
+    const key = pkey orelse return null;
+    errdefer c.EVP_PKEY_free(key);
+
+    const x = c.X509_new() orelse return null;
+    errdefer c.X509_free(x);
+    if (c.X509_set_version(x, 2) != 1) return null;
+    var serial: u64 = undefined;
+    std.crypto.random.bytes(std.mem.asBytes(&serial));
+    serial &= 0x7FFFFFFFFFFFFFFF; // positive
+    if (c.ASN1_INTEGER_set_uint64(c.X509_get_serialNumber(x), serial) != 1) return null;
+    if (c.X509_gmtime_adj(c.X509_getm_notBefore(x), 0) == null) return null;
+    if (c.X509_gmtime_adj(c.X509_getm_notAfter(x), 365 * 24 * 3600) == null) return null;
+    const name = c.X509_get_subject_name(x);
+    if (name == null) return null;
+    if (c.X509_NAME_add_entry_by_txt(name, "CN", c.MBSTRING_ASC, "localhost", -1, -1, 0) != 1) return null;
+    if (c.X509_set_issuer_name(x, c.X509_get_subject_name(x)) != 1) return null; // self-signed
+    if (c.X509_set_pubkey(x, key) != 1) return null;
+    if (c.X509_sign(x, key, c.EVP_sha256()) <= 0) return null;
+    return .{ .key = key, .cert = x };
+}
 
 /// Minimal non-blocking TLS server endpoint for the interlock test.
 const TestServer = struct {
@@ -197,17 +207,13 @@ const TestServer = struct {
         errdefer c.SSL_CTX_free(ctx);
         if (c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_2_VERSION) != 1) return TlsError.SslInitFailed;
 
-        const cbio = c.BIO_new_mem_buf(test_cert_pem.ptr, @intCast(test_cert_pem.len)) orelse return TlsError.SslInitFailed;
-        defer _ = c.BIO_free(cbio);
-        const cert = c.PEM_read_bio_X509(cbio, null, null, null) orelse return TlsError.SslInitFailed;
-        defer c.X509_free(cert);
-        if (c.SSL_CTX_use_certificate(ctx, cert) != 1) return TlsError.SslInitFailed;
-
-        const kbio = c.BIO_new_mem_buf(test_key_pem.ptr, @intCast(test_key_pem.len)) orelse return TlsError.SslInitFailed;
-        defer _ = c.BIO_free(kbio);
-        const pkey = c.PEM_read_bio_PrivateKey(kbio, null, null, null) orelse return TlsError.SslInitFailed;
-        defer c.EVP_PKEY_free(pkey);
-        if (c.SSL_CTX_use_PrivateKey(ctx, pkey) != 1) return TlsError.SslInitFailed;
+        const pki = generateTestPki() orelse return TlsError.SslInitFailed;
+        defer {
+            c.X509_free(pki.cert);
+            c.EVP_PKEY_free(pki.key);
+        }
+        if (c.SSL_CTX_use_certificate(ctx, pki.cert) != 1) return TlsError.SslInitFailed;
+        if (c.SSL_CTX_use_PrivateKey(ctx, pki.key) != 1) return TlsError.SslInitFailed;
 
         const ssl = c.SSL_new(ctx) orelse return TlsError.SslInitFailed;
         errdefer c.SSL_free(ssl);
