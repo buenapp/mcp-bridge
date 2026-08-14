@@ -432,3 +432,85 @@ test "streamable: server request inside a POST SSE stream is answered (no deadlo
     bridge.deinit();
     mock.join();
 }
+
+// --------------------------- mock: --ignore-tool (tools/call + tools/list) ----
+
+/// Streamable mock with one POST per conn (Connection: close for a
+/// deterministic sequence): initialize, a tools/call for the KEPT tool,
+/// then tools/list carrying three tools (one ignored).
+fn mockIgnoreToolMain(mock: *Mock) void {
+    const alloc = mock.alloc;
+
+    // 1: POST initialize
+    var c1 = mock.server.accept() catch return;
+    defer sockClose(&c1.stream);
+    var req1 = readRequest(alloc, &c1.stream) catch return;
+    req1.deinit(alloc);
+    const body1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"serverInfo\":{\"name\":\"mock\"}}}";
+    var hb1: [384]u8 = undefined;
+    const resp1 = std.fmt.bufPrint(&hb1, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body1.len, body1 }) catch return;
+    writeAll(&c1.stream, resp1) catch return;
+
+    // 2: POST tools/call (kept tool) — proves it was forwarded.
+    var c2 = mock.server.accept() catch return;
+    defer sockClose(&c2.stream);
+    var req2 = readRequest(alloc, &c2.stream) catch return;
+    mock.answer_seen = std.mem.indexOf(u8, req2.body, "list_issues") != null;
+    req2.deinit(alloc);
+    const body2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}";
+    var hb2: [384]u8 = undefined;
+    const resp2 = std.fmt.bufPrint(&hb2, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body2.len, body2 }) catch return;
+    writeAll(&c2.stream, resp2) catch return;
+
+    // 3: POST tools/list → three tools, one ignored by the pattern.
+    var c3 = mock.server.accept() catch return;
+    defer sockClose(&c3.stream);
+    var req3 = readRequest(alloc, &c3.stream) catch return;
+    req3.deinit(alloc);
+    const body3 = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"list_issues\"},{\"name\":\"delete_issue\"},{\"name\":\"delete_everything\"}]}}";
+    var hb: [384]u8 = undefined;
+    const resp3 = std.fmt.bufPrint(&hb, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body3.len, body3 }) catch return;
+    writeAll(&c3.stream, resp3) catch return;
+}
+
+test "tools: --ignore-tool blocks tools/call and filters tools/list" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mockIgnoreToolMain);
+
+    var collector = Collector{ .alloc = alloc };
+    defer collector.deinit();
+
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/mcp", .{mock.port()});
+    defer alloc.free(url);
+    var cfg = Config{ .target = try http.parseUrl(url), .url = url, .transport = .http_only };
+    try cfg.ignore_tools.append(alloc, "delete*");
+    defer cfg.ignore_tools.deinit(alloc);
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
+
+    // A blocked tools/call is answered LOCALLY (mcp-remote's -32603) with
+    // no network traffic — this runs before initialize on purpose.
+    bridge.injectLine("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_issue\",\"arguments\":{}}}");
+    try std.testing.expect(collector.contains("\"id\":9"));
+    try std.testing.expect(collector.contains("-32603"));
+    try std.testing.expect(collector.contains("is not available"));
+
+    // A kept tool's call goes upstream (mock asserts it saw it).
+    bridge.injectLine("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    try std.testing.expect(waitFor(&bridge, &collector, "serverInfo"));
+    bridge.injectLine("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_issues\",\"arguments\":{}}}");
+    try std.testing.expect(waitFor(&bridge, &collector, "\"id\":2,\"result\""));
+    try std.testing.expect(mock.answer_seen);
+
+    // tools/list comes back filtered: the two delete* tools are gone.
+    bridge.injectLine("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}");
+    try std.testing.expect(waitFor(&bridge, &collector, "\"id\":3,\"result\""));
+    try std.testing.expect(collector.contains("list_issues"));
+    try std.testing.expect(!collector.contains("delete_everything"));
+
+    bridge.deinit();
+    mock.join();
+}

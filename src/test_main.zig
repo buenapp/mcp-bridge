@@ -246,6 +246,64 @@ test "oauth: buildRegistrationBody defaults and static overlay" {
     try std.testing.expectError(error.BadResponse, oauth.buildRegistrationBody(alloc, "http://x/cb", "\"str\""));
 }
 
+test "mcp: globMatch / toolIgnored (--ignore-tool semantics)" {
+    try std.testing.expect(mcp.globMatch("create*", "create_issue"));
+    try std.testing.expect(mcp.globMatch("*account", "delete_account"));
+    try std.testing.expect(mcp.globMatch("a*c*z", "aXXXcYYYz"));
+    try std.testing.expect(mcp.globMatch("*", "anything"));
+    try std.testing.expect(mcp.globMatch("exact", "exact"));
+    try std.testing.expect(mcp.globMatch("Exact", "exact")); // case-insensitive
+    try std.testing.expect(!mcp.globMatch("exact", "exactly"));
+    try std.testing.expect(!mcp.globMatch("a*b", "acbX")); // suffix must be at end
+    try std.testing.expect(!mcp.globMatch("create*", "recreate_x"));
+    try std.testing.expect(mcp.globMatch("*create*", "recreate_x"));
+
+    const patterns = [_][]const u8{ "delete*", "admin_*" };
+    try std.testing.expect(mcp.toolIgnored(&patterns, "delete_everything"));
+    try std.testing.expect(mcp.toolIgnored(&patterns, "ADMIN_USERS"));
+    try std.testing.expect(!mcp.toolIgnored(&patterns, "list_issues"));
+    try std.testing.expect(!mcp.toolIgnored(&.{}, "anything"));
+}
+
+test "mcp: toolCallName" {
+    const alloc = std.testing.allocator;
+    var guard: ?std.json.Parsed(std.json.Value) = null;
+    defer if (guard) |*g| g.deinit();
+    try std.testing.expectEqualStrings(
+        "delete_issue",
+        mcp.toolCallName(alloc, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_issue\",\"arguments\":{}}}", &guard).?,
+    );
+    if (guard) |*g| g.deinit();
+    guard = null;
+    try std.testing.expect(mcp.toolCallName(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}", &guard) == null);
+    if (guard) |*g| g.deinit();
+    guard = null;
+    try std.testing.expect(mcp.toolCallName(alloc, "not json", &guard) == null);
+}
+
+test "mcp: filterToolsList" {
+    const alloc = std.testing.allocator;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"list_issues\",\"description\":\"l\"},{\"name\":\"delete_issue\",\"description\":\"d\"},{\"name\":\"admin_panel\"}],\"nextCursor\":null}}";
+
+    // No match → null (forward unchanged).
+    try std.testing.expect((mcp.filterToolsList(alloc, body, &.{"create*"}) catch null) == null);
+
+    const filtered = (try mcp.filterToolsList(alloc, body, &.{ "delete*", "admin*" })).?;
+    defer alloc.free(filtered);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered, .{});
+    defer parsed.deinit();
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 1), tools.items.len);
+    try std.testing.expectEqualStrings("list_issues", tools.items[0].object.get("name").?.string);
+    // id and other result fields survive
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
+    try std.testing.expect(parsed.value.object.get("result").?.object.get("nextCursor") != null);
+
+    // Not a tools/list payload → null.
+    try std.testing.expect((mcp.filterToolsList(alloc, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[]}}", &.{"*"}) catch null) == null);
+    try std.testing.expect((mcp.filterToolsList(alloc, "garbage", &.{"*"}) catch null) == null);
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 

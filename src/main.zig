@@ -116,6 +116,9 @@ pub const Config = struct {
     /// --static-oauth-client-metadata: JSON object overlaid on the DCR
     /// request body (redirect_uris stays ours).
     static_metadata: ?[]const u8 = null,
+    /// --ignore-tool patterns (repeatable, glob with '*'): hidden from
+    /// tools/list results and rejected on tools/call (mcp-remote parity).
+    ignore_tools: std.ArrayList([]const u8) = .empty,
     oauth: ?OAuthCfg = null, // non-null: OAuth enabled for this server
     transport: TransportStrategy = .http_first,
 };
@@ -126,6 +129,8 @@ fn usage() noreturn {
         \\
         \\  url                     http(s)://host[:port]/path of the MCP server
         \\  --header "Name: Value"  extra request header (repeatable)
+        \\  --ignore-tool PATTERN   hide tool from tools/list and reject tools/call
+        \\                          (repeatable; glob with '*', case-insensitive)
         \\  --transport T           http-first (default) | http-only | sse-first | sse-only
         \\  --verbose               diagnostics on stderr
         \\  --silent                suppress all stderr output (IDE-quiet)
@@ -696,6 +701,21 @@ pub const Bridge = struct {
             return;
         }
         ulog.vprint("mcp-bridge: >> {s}\n", .{line});
+        // --ignore-tool: reject a tools/call for an ignored tool directly
+        // (mcp-remote parity: -32603, never forwarded upstream).
+        if (self.cfg.ignore_tools.items.len > 0) {
+            var guard: ?std.json.Parsed(std.json.Value) = null;
+            defer if (guard) |*g| g.deinit();
+            if (mcp.toolCallName(self.alloc, line, &guard)) |name| {
+                if (mcp.toolIgnored(self.cfg.ignore_tools.items, name)) {
+                    ulog.vprint("mcp-bridge: [tools] blocked call to ignored tool '{s}'\n", .{name});
+                    var ebuf: [1024]u8 = undefined;
+                    const resp = std.fmt.bufPrint(&ebuf, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":-32603,\"message\":\"Tool \\\"{s}\\\" is not available\"}}}}", .{ mcp.getRequestId(line) orelse "null", name }) catch return;
+                    self.out.writeLine(resp);
+                    return;
+                }
+            }
+        }
         if (self.probe_via_get and !self.probed) {
             // sse_first probe in flight: queue until the transport resolves.
             const owned = self.alloc.dupe(u8, line) catch return;
@@ -711,6 +731,22 @@ pub const Bridge = struct {
     fn writeTransportError(self: *Bridge, rid: ?[]const u8, msg: []const u8) void {
         var ebuf: [512]u8 = undefined;
         self.out.writeLine(mcp.formatTransportError(&ebuf, rid, msg));
+    }
+
+    /// Deliver a server payload to the client, filtering ignored tools out
+    /// of tools/list results when --ignore-tool patterns are configured.
+    fn writeServerPayload(self: *Bridge, payload: []const u8) void {
+        if (self.cfg.ignore_tools.items.len == 0) {
+            self.out.writeLine(payload);
+            return;
+        }
+        if (mcp.filterToolsList(self.alloc, payload, self.cfg.ignore_tools.items) catch null) |filtered| {
+            defer self.alloc.free(filtered);
+            ulog.vprint("mcp-bridge: [tools] filtered tools/list result\n", .{});
+            self.out.writeLine(filtered);
+            return;
+        }
+        self.out.writeLine(payload);
     }
 
     /// The one httpc.Handler surface for every conn; routing by identity.
@@ -751,12 +787,12 @@ pub const Bridge = struct {
                 self.push_last_event_id = self.alloc.dupe(u8, id) catch null;
             }
             ulog.vprint("mcp-bridge: [push] << {s}\n", .{ev.data});
-            self.out.writeLine(ev.data);
+            self.writeServerPayload(ev.data);
         } else {
             // Non-matching event inside a POST's SSE response: a
             // server-pushed message (e.g. sampling request) — forward it.
             ulog.vprint("mcp-bridge: [sse] << {s}\n", .{ev.data});
-            self.out.writeLine(ev.data);
+            self.writeServerPayload(ev.data);
         }
     }
 
@@ -953,7 +989,7 @@ pub const Bridge = struct {
 
         if (r.body.len > 0) {
             ulog.vprint("mcp-bridge: << {d} {s}\n", .{ r.status, r.body });
-            self.out.writeLine(r.body);
+            self.writeServerPayload(r.body);
         } else {
             ulog.vprint("mcp-bridge: << {d} (no body)\n", .{r.status});
         }
@@ -1237,7 +1273,7 @@ pub const Bridge = struct {
             if (self.leg_pending.fetchRemove(rid)) |kv| self.alloc.free(kv.key);
         }
         ulog.vprint("mcp-bridge: [sse] << {s}\n", .{ev.data});
-        self.out.writeLine(ev.data);
+        self.writeServerPayload(ev.data);
         self.maybeCloseLegacyAtShutdown();
     }
 
@@ -1970,6 +2006,13 @@ pub fn main() !void {
                     usage();
                 },
             }
+        } else if (matchValueFlag(args, &i, "--ignore-tool", null)) |m| {
+            const v = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+            try cfg.ignore_tools.append(alloc, v);
         } else if (matchValueFlag(args, &i, "--header", "-H")) |m| {
             const v = switch (m) {
                 .missing => usage(),
