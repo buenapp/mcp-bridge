@@ -73,6 +73,8 @@ pub const PostCtx = struct {
     kind: enum { streamable, legacy } = .streamable,
     /// 401 already re-authenticated once (bridge-level retry budget).
     auth_retried: bool = false,
+    /// 403 insufficient_scope already stepped up once (RFC 6750 §3.1).
+    step_up_retried: bool = false,
     /// A reused-conn failure already retried once on a fresh conn.
     retried: bool = false,
 };

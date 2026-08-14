@@ -172,40 +172,32 @@ pub fn parseProtectedResource(alloc: std.mem.Allocator, body: []const u8) ![]u8 
     };
 }
 
-/// Extract the resource_metadata URL from a 401 WWW-Authenticate header
-/// (e.g. `Bearer resource_metadata="https://.../.well-known/..."`).
-pub fn parseWwwAuthenticateResourceMetadata(header: []const u8) ?[]const u8 {
-    const key = "resource_metadata";
-    const idx = std.ascii.indexOfIgnoreCase(header, key) orelse return null;
-    var rest = header[idx + key.len ..];
-    // skip whitespace and '='
-    rest = std.mem.trimLeft(u8, rest, " \t");
-    if (rest.len == 0 or rest[0] != '=') return null;
-    rest = std.mem.trimLeft(u8, rest[1..], " \t");
-    if (rest.len == 0) return null;
-    if (rest[0] == '"') {
-        const end = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse return null;
-        return rest[1..end];
-    }
-    const end = std.mem.indexOfAny(u8, rest, ", \t") orelse rest.len;
-    return rest[0..end];
-}
-
-/// Extract the scope value from a WWW-Authenticate Bearer challenge
-/// (e.g. `Bearer error="invalid_token", scope="openid profile"`).
-pub fn parseWwwAuthenticateScope(header: []const u8) ?[]const u8 {
-    const key = "scope";
+/// Extract an attribute value from a WWW-Authenticate Bearer challenge,
+/// with token boundaries on BOTH sides (so `error` never matches
+/// `error_description`, nor `resource_error`, and `scope` never matches
+/// `resource_scope`). Handles quoted and unquoted (comma/space-terminated)
+/// values.
+pub fn parseWwwAuthenticateAttr(header: []const u8, key: []const u8) ?[]const u8 {
     var search_from: usize = 0;
     while (std.ascii.indexOfIgnoreCase(header[search_from..], key)) |rel| {
         const idx = search_from + rel;
-        // must not be part of a longer word (e.g. "resource_scope")
+        // Leading boundary: not the tail of a longer token.
         if (idx > 0 and (std.ascii.isAlphanumeric(header[idx - 1]) or header[idx - 1] == '_')) {
             search_from = idx + key.len;
             continue;
         }
-        var rest = header[idx + key.len ..];
-        rest = std.mem.trimLeft(u8, rest, " \t");
-        if (rest.len == 0 or rest[0] != '=') return null;
+        const after = idx + key.len;
+        // Trailing boundary: next char must start the '=' separator (after
+        // optional whitespace), not continue the token.
+        if (after < header.len and (std.ascii.isAlphanumeric(header[after]) or header[after] == '_')) {
+            search_from = after;
+            continue;
+        }
+        var rest = std.mem.trimLeft(u8, header[after..], " \t");
+        if (rest.len == 0 or rest[0] != '=') {
+            search_from = after;
+            continue;
+        }
         rest = std.mem.trimLeft(u8, rest[1..], " \t");
         if (rest.len == 0) return null;
         if (rest[0] == '"') {
@@ -216,6 +208,18 @@ pub fn parseWwwAuthenticateScope(header: []const u8) ?[]const u8 {
         return rest[0..end];
     }
     return null;
+}
+
+/// Extract the resource_metadata URL from a 401 WWW-Authenticate header
+/// (e.g. `Bearer resource_metadata="https://.../.well-known/..."`).
+pub fn parseWwwAuthenticateResourceMetadata(header: []const u8) ?[]const u8 {
+    return parseWwwAuthenticateAttr(header, "resource_metadata");
+}
+
+/// Extract the scope value from a WWW-Authenticate Bearer challenge
+/// (e.g. `Bearer error="invalid_token", scope="openid profile"`).
+pub fn parseWwwAuthenticateScope(header: []const u8) ?[]const u8 {
+    return parseWwwAuthenticateAttr(header, "scope");
 }
 
 // ------------------------------------------------------------- token cache --

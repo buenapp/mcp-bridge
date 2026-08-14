@@ -189,6 +189,27 @@ test "oauth: parseWwwAuthenticateScope" {
     try std.testing.expect(oauth.parseWwwAuthenticateScope("Bearer realm=\"x\"") == null);
 }
 
+test "oauth: parseWwwAuthenticateAttr token boundaries (insufficient_scope step-up)" {
+    // error must not match error_description, and vice versa both resolve.
+    const wa = "Bearer error=\"insufficient_scope\", error_description=\"Additional scope required\", scope=\"mcp:admin mcp:write\"";
+    try std.testing.expectEqualStrings("insufficient_scope", oauth.parseWwwAuthenticateAttr(wa, "error").?);
+    try std.testing.expectEqualStrings("Additional scope required", oauth.parseWwwAuthenticateAttr(wa, "error_description").?);
+    try std.testing.expectEqualStrings("mcp:admin mcp:write", oauth.parseWwwAuthenticateAttr(wa, "scope").?);
+
+    // error_description present, error absent → error stays null (no
+    // prefix bleed into error_description's value).
+    const wa2 = "Bearer error_description=\"x\"";
+    try std.testing.expect(oauth.parseWwwAuthenticateAttr(wa2, "error") == null);
+
+    // resource_scope must not satisfy scope.
+    try std.testing.expect(oauth.parseWwwAuthenticateAttr("Bearer resource_scope=\"s\"", "scope") == null);
+
+    // case-insensitive keys; unquoted value terminated by comma/space.
+    const wa3 = "bearer ERROR=\"invalid_token\"";
+    try std.testing.expectEqualStrings("invalid_token", oauth.parseWwwAuthenticateAttr(wa3, "error").?);
+    try std.testing.expectEqualStrings("openid", oauth.parseWwwAuthenticateAttr("Bearer scope=openid, realm=\"x\"", "scope").?);
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 

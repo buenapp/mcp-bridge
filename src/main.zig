@@ -199,6 +199,7 @@ pub const Bridge = struct {
     leg_ready_ever: bool = false,
     leg_reconnecting: bool = false, // one immediate reconnect under queue pressure
     leg_auth_retried: bool = false, // per-attempt 401 budget
+    leg_step_up_done: bool = false, // per-attempt insufficient_scope step-up budget
     leg_pending: std.StringHashMapUnmanaged(void) = .empty, // request ids awaiting stream responses
     leg_queue: std.ArrayList([]u8) = .empty, // lines waiting for endpoint readiness (owned)
 
@@ -699,7 +700,7 @@ pub const Bridge = struct {
         }
         switch (self.mode) {
             .legacy => self.legacySendLine(line),
-            .streamable => self.streamableSendLine(line, false, false),
+            .streamable => self.streamableSendLine(line, false, false, false),
         }
     }
 
@@ -781,7 +782,8 @@ pub const Bridge = struct {
     /// POST one JSON-RPC message in streamable mode. Reuses the idle
     /// keep-alive conn when available; a reused-conn transport failure
     /// retries once on a fresh conn; a 401 re-auths once and resends.
-    fn streamableSendLine(self: *Bridge, line: []const u8, auth_retried: bool, retried: bool) void {
+    /// step_up: a 403 insufficient_scope already drove one scope step-up.
+    fn streamableSendLine(self: *Bridge, line: []const u8, auth_retried: bool, retried: bool, step_up: bool) void {
         const t = self.cfg.target;
 
         // Proactive: acquire/refresh a token when OAuth is configured.
@@ -819,6 +821,7 @@ pub const Bridge = struct {
             };
             ic.role.post.auth_retried = auth_retried;
             ic.role.post.retried = retried;
+            ic.role.post.step_up_retried = step_up;
             return;
         }
 
@@ -828,6 +831,7 @@ pub const Bridge = struct {
         };
         conn.role.post.auth_retried = auth_retried;
         conn.role.post.retried = retried;
+        conn.role.post.step_up_retried = step_up;
         self.trackConn(conn);
     }
 
@@ -867,8 +871,36 @@ pub const Bridge = struct {
                     self.writeTransportError(mcp.getRequestId(line.?), @errorName(err));
                     return;
                 };
-            self.streamableSendLine(line.?, true, false);
+            self.streamableSendLine(line.?, true, false, false);
             return;
+        }
+
+        // 403 + Bearer error="insufficient_scope" (RFC 6750 §3.1): the
+        // token is valid but lacks scope. Step up ONCE: full flow with the
+        // challenge's scope, then resend.
+        if (r.status == 403 and !conn.role.post.step_up_retried) {
+            if (r.www_authenticate) |wa0| {
+                const is_step_up = if (oauth.parseWwwAuthenticateAttr(wa0, "error")) |e|
+                    std.mem.eql(u8, e, "insufficient_scope")
+                else
+                    false;
+                if (is_step_up) {
+                    const wa = self.alloc.dupe(u8, wa0) catch null;
+                    defer if (wa) |h| self.alloc.free(h);
+                    const line = if (conn.role.post.line) |l| self.alloc.dupe(u8, l) catch null else null;
+                    defer if (line) |l| self.alloc.free(l);
+                    conn.close();
+                    if (line == null) return;
+                    ulog.vprint("mcp-bridge: [oauth] 403 insufficient_scope, stepping up scope\n", .{});
+                    const step_scope = if (wa) |h| oauth.parseWwwAuthenticateAttr(h, "scope") else null;
+                    self.fullAuthFlow(wa, step_scope) catch |err| {
+                        self.writeTransportError(mcp.getRequestId(line.?), @errorName(err));
+                        return;
+                    };
+                    self.streamableSendLine(line.?, true, false, true);
+                    return;
+                }
+            }
         }
 
         // 404/405 on a streamable POST: the server doesn't speak
@@ -960,7 +992,7 @@ pub const Bridge = struct {
                 if (owned) |l| {
                     defer self.alloc.free(l);
                     ulog.vprint("mcp-bridge: stale connection ({s}), retrying once on fresh connection\n", .{@errorName(e)});
-                    self.streamableSendLine(l, conn_auth_retried(conn), true);
+                    self.streamableSendLine(l, conn_auth_retried(conn), true, conn.role.post.step_up_retried);
                 }
                 return;
             }
@@ -1255,6 +1287,7 @@ pub const Bridge = struct {
         self.leg_ready_ever = true;
         self.leg_reconnecting = false;
         self.leg_auth_retried = false;
+        self.leg_step_up_done = false;
         if (self.probe_via_get and !self.probed) {
             self.probe_via_get = false;
             self.mode = .legacy;
@@ -1337,7 +1370,7 @@ pub const Bridge = struct {
         defer self.alloc.free(queued);
         for (queued) |line| {
             defer self.alloc.free(line);
-            self.streamableSendLine(line, false, false);
+            self.streamableSendLine(line, false, false, false);
         }
     }
 
@@ -1464,6 +1497,34 @@ pub const Bridge = struct {
             return;
         }
 
+        // 403 + Bearer error="insufficient_scope" (RFC 6750 §3.1): valid
+        // token, missing scope — step up once with the challenge's scope.
+        if (r.status == 403 and !self.leg_step_up_done) {
+            if (r.www_authenticate) |wa0| {
+                const is_step_up = if (oauth.parseWwwAuthenticateAttr(wa0, "error")) |e|
+                    std.mem.eql(u8, e, "insufficient_scope")
+                else
+                    false;
+                if (is_step_up) {
+                    const wa = self.alloc.dupe(u8, wa0) catch null;
+                    defer if (wa) |h| self.alloc.free(h);
+                    const line = if (conn.role.post.line) |l| self.alloc.dupe(u8, l) catch null else null;
+                    defer if (line) |l| self.alloc.free(l);
+                    conn.close();
+                    if (line == null) return;
+                    ulog.vprint("mcp-bridge: [oauth] 403 insufficient_scope, stepping up scope\n", .{});
+                    self.leg_step_up_done = true;
+                    const step_scope = if (wa) |h| oauth.parseWwwAuthenticateAttr(h, "scope") else null;
+                    self.fullAuthFlow(wa, step_scope) catch |err| {
+                        self.legacyPostFailed(line.?, @errorName(err));
+                        return;
+                    };
+                    self.legacyPostResend(line.?);
+                    return;
+                }
+            }
+        }
+
         if (r.status >= 200 and r.status < 300) {
             conn.close();
             return; // accepted; the response arrives on the event stream
@@ -1500,6 +1561,7 @@ pub const Bridge = struct {
         };
         conn.role.post.kind = .legacy;
         conn.role.post.auth_retried = true;
+        conn.role.post.step_up_retried = self.leg_step_up_done;
         if (ep.secure) {
             self.setupConnVerifier(conn, ep) catch {
                 conn.close();
@@ -1607,7 +1669,7 @@ pub const Bridge = struct {
             return; // OAuth not configured and no 401 yet — nothing to do
         }
 
-        try self.fullAuthFlow(www_authenticate);
+        try self.fullAuthFlow(www_authenticate, null);
     }
 
     /// 401 path: token rejected while still "valid". Force a refresh (once)
@@ -1620,7 +1682,7 @@ pub const Bridge = struct {
                 }
             }
         }
-        try self.fullAuthFlow(www_authenticate);
+        try self.fullAuthFlow(www_authenticate, null);
     }
 
     fn refreshTokens(self: *Bridge, refresh_token: []const u8) !void {
@@ -1647,7 +1709,10 @@ pub const Bridge = struct {
         return d;
     }
 
-    fn fullAuthFlow(self: *Bridge, www_authenticate: ?[]const u8) !void {
+    /// The full grant flow (client-credentials or interactive auth-code).
+    /// scope_override comes from a 403 insufficient_scope challenge
+    /// (RFC 6750 §3.1) and wins over the configured scope.
+    fn fullAuthFlow(self: *Bridge, www_authenticate: ?[]const u8, scope_override: ?[]const u8) !void {
         const alloc = self.alloc;
         const cfg = self.cfg.oauth orelse OAuthCfg{};
         const disc = try self.discover(www_authenticate);
@@ -1666,7 +1731,7 @@ pub const Bridge = struct {
                 log.err("--oauth-grant client_credentials requires --oauth-client-secret", .{});
                 return oauth.OAuthError.BadResponse;
             };
-            var t = try oauth.clientCredentials(alloc, disc.as.token_endpoint, cid, secret, cfg.scope, resource);
+            var t = try oauth.clientCredentials(alloc, disc.as.token_endpoint, cid, secret, scope_override orelse cfg.scope, resource);
             t.client_id = cid;
             self.adoptTokens(t);
             try oauth.saveTokenCache(alloc, self.cfg.url, self.cacheResource(), self.tokens.?);
@@ -1758,9 +1823,10 @@ pub const Bridge = struct {
         var state: [32]u8 = undefined;
         _ = std.fmt.bufPrint(&state, "{x}", .{state_rand}) catch unreachable;
 
-        // Scope: configured, else the one the resource server demanded in
-        // its 401 challenge (RFC 9728 / MCP spec).
-        const scope = cfg.scope orelse
+        // Scope: step-up override (403 insufficient_scope challenge), else
+        // configured, else the one the resource server demanded in its 401
+        // challenge (RFC 9728 / MCP spec).
+        const scope = scope_override orelse cfg.scope orelse
             if (www_authenticate) |wa| oauth.parseWwwAuthenticateScope(wa) else null;
 
         const auth_url = try oauth.buildAuthUrl(alloc, authz_ep, client_id, redirect_uri, &challenge, &state, scope, resource);
