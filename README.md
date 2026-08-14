@@ -211,10 +211,40 @@ then open the URL manually.
 --oauth-scope SCOPES        scopes to request (else the server's 401 scope)
 --oauth-grant GRANT         authorization_code | client_credentials (default: auto)
 --resource URI              RFC 8707 resource indicator (default: the server URL)
+--host NAME                 OAuth callback host (default localhost; some
+                            authorization servers reject "localhost" redirects)
+--static-oauth-client-metadata JSON   DCR metadata overlay (or @file.json)
+--auth-timeout SECS         OAuth browser-flow callback timeout (default 180)
 --transport T               http-first (default) | http-only | sse-first | sse-only
 --config PATH               JSON config file
 --oauth-logout              delete cached tokens for <url> and exit
+--ignore-tool PATTERN       hide tool from tools/list, reject tools/call
+                            (repeatable; glob with '*', case-insensitive)
+--enable-proxy              honor http_proxy/https_proxy/no_proxy env vars
+--verbose                   diagnostics on stderr
+--silent                    suppress all stderr output (IDE-quiet)
+--debug                     append full diagnostics to <tokens-dir>/<hash>_debug.log
 ```
+
+**Scope step-up.** A 403 with `WWW-Authenticate: Bearer
+error="insufficient_scope", scope="..."` (RFC 6750 §3.1) re-runs the auth
+flow once, requesting the challenge's scope (it wins over `--oauth-scope`),
+then resends the request.
+
+**Proxies.** With `--enable-proxy`, https targets tunnel through the proxy
+with CONNECT (TLS and DANE/PKI verification still run end-to-end against
+the origin); plain-http targets use absolute-form requests. Proxy URLs are
+`http://[user[:pass]@]host[:port]`; `no_proxy` bypasses by exact host,
+domain suffix, optional `:port`, or `*`.
+
+**Tool filtering.** `--ignore-tool` hides matching tools from tools/list
+results and answers calls to them locally with mcp-remote's
+`-32603 Tool "X" is not available` — the server never sees either.
+
+**Diagnostics.** `--debug` records the full diagnostic stream (both
+message classes, regardless of `--verbose`/`--silent`) to
+`<tokens-dir>/<hash>_debug.log`, timestamped — the mcp-remote
+`~/.mcp-auth/<hash>_debug.log` analog.
 
 **Grant selection.** With `--oauth-grant authorization_code`, a configured
 client id + secret runs the interactive authorization-code flow as a
