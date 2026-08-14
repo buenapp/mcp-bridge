@@ -27,6 +27,8 @@ const http = @import("http.zig");
 const mcp = @import("mcp.zig");
 const sse = @import("sse.zig");
 const nb = if (platform.is_windows) @import("nb_win.zig") else @import("nb_posix.zig");
+const proxy = @import("proxy.zig");
+const ulog = @import("ulog.zig");
 
 const log = std.log.scoped(.httpc);
 
@@ -39,11 +41,14 @@ pub const Error = error{
     MalformedResponse,
     ResponseTooLarge,
     SseEndedWithoutResponse,
+    /// The proxy rejected (or dropped) the CONNECT tunnel.
+    ProxyTunnelFailed,
     OutOfMemory,
 };
 
 pub const State = enum {
     connecting, // TCP connect in flight (EINPROGRESS)
+    proxy_tunnel, // CONNECT exchange through a --enable-proxy proxy (https)
     handshaking, // TLS handshake driving
     writing, // request bytes flushing
     read_head, // accumulating response headers
@@ -91,6 +96,29 @@ pub const Handler = struct {
     onEvent: *const fn (ctx: *anyopaque, conn: *Conn, ev: *const sse.Event) void,
     onEnd: *const fn (ctx: *anyopaque, conn: *Conn, err: ?anyerror) void,
 };
+
+/// Plain-http targets through a proxy use absolute-form request lines
+/// ("GET http://host:port/path HTTP/1.1"); the Host header stays the
+/// origin's. Rewrites wq's request line in place (called from start()).
+fn rewriteAbsoluteForm(conn: *Conn) void {
+    const t = conn.target;
+    const items = conn.wq.items;
+    const line_end = std.mem.indexOf(u8, items, "\r\n") orelse return;
+    const line = items[0..line_end];
+    const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return;
+    const proto_idx = std.mem.lastIndexOf(u8, line, " HTTP/") orelse return;
+    const path = line[sp1 + 1 .. proto_idx];
+    if (std.mem.startsWith(u8, path, "http")) return; // already absolute
+
+    var new_req: std.ArrayList(u8) = .empty;
+    appendFmt(conn.alloc, &new_req, "{s} http://{s}:{d}{s}{s}", .{ line[0..sp1], t.host, t.port, path, line[proto_idx..] }) catch return;
+    new_req.appendSlice(conn.alloc, items[line_end..]) catch {
+        new_req.deinit(conn.alloc);
+        return;
+    };
+    conn.wq.deinit(conn.alloc);
+    conn.wq = new_req;
+}
 
 /// Build the wire bytes for a request. method: "POST"/"GET"/"DELETE".
 /// accept: e.g. "application/json, text/event-stream". content_type/body
@@ -286,6 +314,16 @@ pub const Conn = struct {
 
     handshake_need: enum { none, read, write } = .none,
 
+    // ---- proxy CONNECT tunnel (--enable-proxy, https targets) ----
+    /// Non-null: this conn goes through the proxy (plain TCP phase talks
+    /// to the proxy; TLS + the request still target the origin).
+    proxy_ep: ?proxy.Endpoint = null,
+    tunnel_req: [1024]u8 = undefined, // CONNECT request bytes
+    tunnel_req_len: usize = 0,
+    tunnel_wpos: usize = 0,
+    tunnel_buf: [4096]u8 = undefined, // CONNECT response head
+    tunnel_len: usize = 0,
+
     // ------------------------------------------------------------ setup ----
 
     /// Create + start a POST conn. `request` is moved (conn frees it).
@@ -340,7 +378,15 @@ pub const Conn = struct {
         };
         errdefer conn.deinitMem();
 
-        nb.Stream.startConnectInto(&conn.stream, alloc, target.host, target.port, evp, conn) catch return Error.ConnectFailed;
+        // --enable-proxy: https targets tunnel (CONNECT) through the
+        // proxy; plain-http targets get absolute-form request lines.
+        const px = proxy.forTarget(target);
+        conn.proxy_ep = px;
+        const connect_host = if (px) |p| p.host else target.host;
+        const connect_port = if (px) |p| p.port else target.port;
+        if (px != null and !target.secure) rewriteAbsoluteForm(conn);
+
+        nb.Stream.startConnectInto(&conn.stream, alloc, connect_host, connect_port, evp, conn) catch return Error.ConnectFailed;
 
         // Persistent edge-triggered read interest for the conn's whole
         // life; one-shot write interest for connect completion (the event
@@ -481,6 +527,7 @@ pub const Conn = struct {
         while (!self.closing and guard < 1000) : (guard += 1) {
             const progressed = switch (self.state) {
                 .connecting => self.driveConnecting(),
+                .proxy_tunnel => self.driveProxyTunnel(),
                 .handshaking => self.driveHandshake(),
                 .writing => self.driveWrite(),
                 .read_head, .read_body, .sse_stream => self.driveRead(),
@@ -498,10 +545,107 @@ pub const Conn = struct {
             self.fail(error.ConnectFailed);
             return true;
         };
+        // Proxied https target: tunnel first (CONNECT), then TLS to the
+        // ORIGIN through the tunnel.
+        if (self.proxy_ep != null and self.target.secure) {
+            self.buildTunnelRequest();
+            self.state = .proxy_tunnel;
+            return true;
+        }
         if (!self.target.secure) {
             self.state = .writing;
             return true;
         }
+        self.stream.swapToTls(self.alloc, self.target.host) catch {
+            self.fail(error.HandshakeFailed);
+            return true;
+        };
+        self.state = .handshaking;
+        return true;
+    }
+
+    /// The CONNECT request for the tunnel (built once at state entry).
+    fn buildTunnelRequest(self: *Conn) void {
+        const px = self.proxy_ep.?;
+        const t = self.target;
+        var fbs = std.io.fixedBufferStream(&self.tunnel_req);
+        const w = fbs.writer();
+        w.print("CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n", .{ t.host, t.port, t.host, t.port }) catch {};
+        if (px.auth) |a| w.print("Proxy-Authorization: {s}\r\n", .{a}) catch {};
+        w.writeAll("\r\n") catch {};
+        self.tunnel_req_len = fbs.pos;
+    }
+
+    /// CONNECT exchange with the proxy: write the request, read the
+    /// response head, then hand off to the TLS handshake (origin SNI and
+    /// verification are unaffected — the tunnel is transparent TCP).
+    fn driveProxyTunnel(self: *Conn) bool {
+        // Write phase (plain stream: no TLS want_read interplay).
+        while (self.tunnel_wpos < self.tunnel_req_len) {
+            if (!platform.is_windows and !self.write_ready) {
+                self.armWrite();
+                return false;
+            }
+            const r = self.stream.writeNb(self.tunnel_req[self.tunnel_wpos..self.tunnel_req_len]) catch {
+                self.fail(error.SocketError);
+                return true;
+            };
+            switch (r) {
+                .done => |n| self.tunnel_wpos += n,
+                .want_write => {
+                    self.write_ready = false;
+                    self.armWrite();
+                    return false;
+                },
+                .want_read => unreachable, // plain stream never wants read on write
+            }
+        }
+        // Read phase: the head ends at CRLFCRLF.
+        while (std.mem.indexOf(u8, self.tunnel_buf[0..self.tunnel_len], "\r\n\r\n") == null) {
+            if (self.tunnel_len == self.tunnel_buf.len) {
+                self.fail(error.ProxyTunnelFailed);
+                return true;
+            }
+            if (!platform.is_windows and !self.read_ready) return false;
+            const r = self.stream.readNb(self.tunnel_buf[self.tunnel_len..]) catch {
+                self.fail(error.SocketError);
+                return true;
+            };
+            switch (r) {
+                .data => |n| self.tunnel_len += n,
+                .want_read => {
+                    self.read_ready = false;
+                    return false;
+                },
+                .want_write => unreachable,
+                .eof => {
+                    self.fail(error.ProxyTunnelFailed);
+                    return true;
+                },
+            }
+        }
+        // "HTTP/1.1 200 Connection established" — any 2xx establishes.
+        const head = self.tunnel_buf[0..self.tunnel_len];
+        const line_end = std.mem.indexOf(u8, head, "\r\n") orelse {
+            self.fail(error.ProxyTunnelFailed);
+            return true;
+        };
+        const line = head[0..line_end];
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse {
+            self.fail(error.ProxyTunnelFailed);
+            return true;
+        };
+        const code_end = @min(sp + 4, line.len);
+        const code = std.fmt.parseInt(u16, line[sp + 1 .. code_end], 10) catch {
+            self.fail(error.ProxyTunnelFailed);
+            return true;
+        };
+        if (code < 200 or code >= 300) {
+            log.err("proxy CONNECT {s}:{d} rejected: HTTP {d}", .{ self.target.host, self.target.port, code });
+            self.fail(error.ProxyTunnelFailed);
+            return true;
+        }
+        ulog.vprint("mcp-bridge: [proxy] CONNECT tunnel to {s}:{d} established\n", .{ self.target.host, self.target.port });
         self.stream.swapToTls(self.alloc, self.target.host) catch {
             self.fail(error.HandshakeFailed);
             return true;
@@ -842,7 +986,7 @@ pub const Conn = struct {
                 self.state = .done;
                 self.handler.onEnd(self.handler.ctx, self, null);
             },
-            .connecting, .handshaking, .writing => self.fail(error.SocketError),
+            .connecting, .proxy_tunnel, .handshaking, .writing => self.fail(error.SocketError),
             .done => {},
         }
     }

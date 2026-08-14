@@ -37,6 +37,7 @@ const pkce = @import("pkce.zig");
 const loopback = @import("oauth_loopback.zig");
 const oauth_lock = @import("oauth_lock.zig");
 const ulog = @import("ulog.zig");
+const proxy = @import("proxy.zig");
 const config_file = @import("config.zig");
 const evport = @import("evport.zig");
 const httpc = @import("httpc.zig");
@@ -113,6 +114,9 @@ pub const Config = struct {
     /// --host: OAuth callback hostname for the redirect URI (default
     /// "localhost"); the listener binds its first IPv4 resolution.
     callback_host: ?[]const u8 = null,
+    /// --enable-proxy: honor http_proxy/https_proxy/no_proxy env vars
+    /// (CONNECT tunnels for https, absolute-form for http).
+    enable_proxy: bool = false,
     /// --static-oauth-client-metadata: JSON object overlaid on the DCR
     /// request body (redirect_uris stays ours).
     static_metadata: ?[]const u8 = null,
@@ -136,6 +140,8 @@ fn usage() noreturn {
         \\  --silent                suppress all stderr output (IDE-quiet)
         \\  --debug                 append full diagnostics to <tokens-dir>/<hash>_debug.log
         \\  --auth-timeout SECS     OAuth browser-flow callback timeout (default 180)
+        \\  --enable-proxy          honor http_proxy/https_proxy/no_proxy env vars
+        \\                          (CONNECT tunnel for https, absolute-form for http)
         \\
         \\OAuth 2.1 (auto-activates on a 401 even without flags):
         \\  --oauth                 enable OAuth for this server
@@ -1958,6 +1964,8 @@ pub fn main() !void {
             cfg.silent = true;
         } else if (std.mem.eql(u8, a, "--debug")) {
             cfg.debug = true;
+        } else if (std.mem.eql(u8, a, "--enable-proxy")) {
+            cfg.enable_proxy = true;
         } else if (matchValueFlag(args, &i, "--auth-timeout", null)) |m| {
             const v = switch (m) {
                 .missing => usage(),
@@ -2076,6 +2084,7 @@ pub fn main() !void {
     cfg.url = url.?;
     ulog.verbose = cfg.verbose;
     ulog.silent = cfg.silent;
+    if (cfg.enable_proxy) proxy.initFromEnv(alloc);
 
     // Config file (flags override file values)
     const cf_path = config_path orelse (config_file.defaultPath(alloc) catch null) orelse "";

@@ -119,6 +119,9 @@ pub const Mock = struct {
     last_event_id_seen: bool = false,
     /// Sampling test: the client's answer POST arrived while stream 1 open.
     answer_seen: bool = false,
+    /// Generic payload counter (e.g. bytes of a TLS ClientHello seen
+    /// inside a proxy tunnel).
+    extra: usize = 0,
 
     pub fn start(alloc: std.mem.Allocator) !Mock {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);

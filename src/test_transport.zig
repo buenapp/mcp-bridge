@@ -70,6 +70,7 @@ const testkit = @import("testkit.zig");
 const Req = testkit.Req;
 const readRequest = testkit.readRequest;
 const writeAll = testkit.sockWriteAll;
+const sockRead = testkit.sockRead;
 const drainUntilClose = testkit.drainUntilClose;
 const Mock = testkit.Mock;
 const sseResponseHead = testkit.sseResponseHead;
@@ -433,7 +434,108 @@ test "streamable: server request inside a POST SSE stream is answered (no deadlo
     mock.join();
 }
 
-// --------------------------- mock: --ignore-tool (tools/call + tools/list) ----
+// --------------------------- mock: proxy (CONNECT tunnel / absolute-form) ----
+
+/// Proxy mock: expect a CONNECT with Proxy-Authorization, answer 200, then
+/// HOLD the tunnel open and record the TLS ClientHello bytes the bridge
+/// sends through it (proof the tunnel carried the origin TLS session).
+fn mockProxyTunnelMain(mock: *Mock) void {
+    const alloc = mock.alloc;
+    var c1 = mock.server.accept() catch return;
+    defer sockClose(&c1.stream);
+    var req = readRequest(alloc, &c1.stream) catch return;
+    defer req.deinit(alloc);
+    mock.answer_seen = std.mem.indexOf(u8, req.head, "CONNECT origin.example:443 HTTP/1.1") != null and
+        std.mem.indexOf(u8, req.head, "Proxy-Authorization: Basic dTpw") != null;
+    writeAll(&c1.stream, "HTTP/1.1 200 Connection established\r\n\r\n") catch return;
+    // The TLS ClientHello arrives through the tunnel.
+    var buf: [512]u8 = undefined;
+    const n = sockRead(&c1.stream, &buf) catch 0;
+    mock.extra = n;
+    // Hold open; the bridge's deinit closes us.
+    drainUntilClose(&c1.stream);
+}
+
+test "proxy: https target tunnels via CONNECT with proxy auth" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mockProxyTunnelMain);
+
+    var collector = Collector{ .alloc = alloc };
+    defer collector.deinit();
+
+    const proxy_mod = @import("proxy.zig");
+    proxy_mod.enabled = true;
+    defer proxy_mod.enabled = false;
+    const target = http.Target{ .secure = true, .host = "origin.example", .port = 443, .path = "/mcp" };
+    proxy_mod.setForTest(target, .{ .host = "127.0.0.1", .port = mock.port(), .auth = "Basic dTpw" });
+    defer proxy_mod.setForTest(target, null);
+
+    var cfg = Config{ .target = target, .url = "https://origin.example/mcp", .transport = .http_only };
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
+
+    bridge.injectLine("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    // The ClientHello (through the tunnel) lands in the mock.
+    const helloCond = struct {
+        fn f(m: *Mock) bool {
+            return m.extra > 0;
+        }
+    }.f;
+    var rounds: usize = 0;
+    while (!helloCond(&mock) and rounds < 500) : (rounds += 1) bridge.step(10) catch break;
+    try std.testing.expect(mock.extra > 0);
+    try std.testing.expect(mock.answer_seen); // CONNECT line + auth header
+
+    bridge.deinit();
+    mock.join();
+}
+
+/// Proxy mock for a PLAIN http target: the request line must be
+/// absolute-form; answer the JSON response directly (no tunnel).
+fn mockProxyAbsMain(mock: *Mock) void {
+    const alloc = mock.alloc;
+    var c1 = mock.server.accept() catch return;
+    defer sockClose(&c1.stream);
+    var req = readRequest(alloc, &c1.stream) catch return;
+    defer req.deinit(alloc);
+    mock.answer_seen = std.mem.indexOf(u8, req.head, "POST http://127.0.0.1:1/mcp HTTP/1.1") != null;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"via\":\"proxy\"}}";
+    var hb: [256]u8 = undefined;
+    const resp = std.fmt.bufPrint(&hb, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+    writeAll(&c1.stream, resp) catch return;
+}
+
+test "proxy: plain http target uses absolute-form through the proxy" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mockProxyAbsMain);
+
+    var collector = Collector{ .alloc = alloc };
+    defer collector.deinit();
+
+    const proxy_mod = @import("proxy.zig");
+    proxy_mod.enabled = true;
+    defer proxy_mod.enabled = false;
+    const target = http.Target{ .secure = false, .host = "127.0.0.1", .port = 1, .path = "/mcp" };
+    proxy_mod.setForTest(target, .{ .host = "127.0.0.1", .port = mock.port() });
+    defer proxy_mod.setForTest(target, null);
+
+    var cfg = Config{ .target = target, .url = "http://127.0.0.1:1/mcp", .transport = .http_only };
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
+
+    bridge.injectLine("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    try std.testing.expect(waitFor(&bridge, &collector, "\"via\":\"proxy\""));
+    try std.testing.expect(mock.answer_seen); // absolute-form request line
+
+    bridge.deinit();
+    mock.join();
+}
 
 /// Streamable mock with one POST per conn (Connection: close for a
 /// deterministic sequence): initialize, a tools/call for the KEPT tool,
