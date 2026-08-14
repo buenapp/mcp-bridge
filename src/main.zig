@@ -113,6 +113,9 @@ pub const Config = struct {
     /// --host: OAuth callback hostname for the redirect URI (default
     /// "localhost"); the listener binds its first IPv4 resolution.
     callback_host: ?[]const u8 = null,
+    /// --static-oauth-client-metadata: JSON object overlaid on the DCR
+    /// request body (redirect_uris stays ours).
+    static_metadata: ?[]const u8 = null,
     oauth: ?OAuthCfg = null, // non-null: OAuth enabled for this server
     transport: TransportStrategy = .http_first,
 };
@@ -138,6 +141,7 @@ fn usage() noreturn {
         \\  --resource URI          RFC 8707 resource indicator (default: the server URL)
         \\  --host NAME             OAuth callback host (default localhost; some
         \\                          authorization servers reject "localhost" redirects)
+        \\  --static-oauth-client-metadata JSON   DCR metadata overlay (or @file.json)
         \\  --config PATH           JSON config file (default: ~/.config/mcp-bridge/config.json)
         \\  --oauth-logout          delete cached tokens for <url> and exit
         \\
@@ -1812,7 +1816,7 @@ pub const Bridge = struct {
                 return oauth.OAuthError.NoRegistrationEndpoint;
             };
             ulog.vprint("mcp-bridge: [oauth] registering client via DCR\n", .{});
-            break :blk try oauth.registerClient(alloc, reg_ep, redirect_uri);
+            break :blk try oauth.registerClient(alloc, reg_ep, redirect_uri, self.cfg.static_metadata);
         };
         defer if (cfg.client_id == null) alloc.free(client_id);
 
@@ -1939,6 +1943,33 @@ pub fn main() !void {
                 .value => |v| v,
                 .no => unreachable,
             };
+        } else if (matchValueFlag(args, &i, "--static-oauth-client-metadata", null)) |m| {
+            const v = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+            // @file.json reads from disk (mcp-remote parity); else inline JSON.
+            cfg.static_metadata = if (std.mem.startsWith(u8, v, "@"))
+                std.fs.cwd().readFileAlloc(alloc, v[1..], 1 << 16) catch |err| {
+                    log.err("--static-oauth-client-metadata {s}: {s}", .{ v, @errorName(err) });
+                    usage();
+                }
+            else
+                v;
+            // Validate now: must be a JSON object.
+            const probe = std.json.parseFromSlice(std.json.Value, alloc, cfg.static_metadata.?, .{}) catch {
+                log.err("--static-oauth-client-metadata is not valid JSON", .{});
+                usage();
+            };
+            defer probe.deinit();
+            switch (probe.value) {
+                .object => {},
+                else => {
+                    log.err("--static-oauth-client-metadata must be a JSON object", .{});
+                    usage();
+                },
+            }
         } else if (matchValueFlag(args, &i, "--header", "-H")) |m| {
             const v = switch (m) {
                 .missing => usage(),

@@ -552,16 +552,16 @@ pub fn buildAuthUrl(
 }
 
 /// RFC 7591 dynamic client registration (public client, loopback redirect).
+/// static_metadata (a JSON object from --static-oauth-client-metadata)
+/// overlays our defaults; redirect_uris is always ours — the loopback
+/// listener owns it.
 pub fn registerClient(
     alloc: std.mem.Allocator,
     registration_endpoint: []const u8,
     redirect_uri: []const u8,
+    static_metadata: ?[]const u8,
 ) ![]u8 {
-    const redirect_json = try std.json.Stringify.valueAlloc(alloc, redirect_uri, .{});
-    defer alloc.free(redirect_json);
-    const body = try std.fmt.allocPrint(alloc,
-        \\{{"client_name":"mcp-bridge","redirect_uris":[{s}],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"}}
-    , .{redirect_json});
+    const body = try buildRegistrationBody(alloc, redirect_uri, static_metadata);
     defer alloc.free(body);
 
     vprint("mcp-bridge: [oauth] POST {s} (DCR)\n", .{registration_endpoint});
@@ -580,4 +580,48 @@ pub fn registerClient(
     };
     const client_id = getStr(obj, "client_id") orelse return OAuthError.BadResponse;
     return try alloc.dupe(u8, client_id);
+}
+
+/// DCR request body: our defaults, overlaid with the static metadata
+/// object's fields (client_name, scope, logo_uri, contacts, ...), with
+/// redirect_uris forced to the loopback listener's URI.
+pub fn buildRegistrationBody(alloc: std.mem.Allocator, redirect_uri: []const u8, static_metadata: ?[]const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var map = std.json.ObjectMap.init(a);
+    // Values reference the static_metadata input text / string literals /
+    // the caller's redirect_uri — all outlive the serialization below.
+    if (static_metadata) |sm| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, sm, .{});
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return OAuthError.BadResponse,
+        };
+        var it = obj.iterator();
+        while (it.next()) |e| {
+            try map.put(e.key_ptr.*, e.value_ptr.*);
+        }
+    }
+    if (!map.contains("client_name")) try map.put("client_name", .{ .string = "mcp-bridge" });
+    if (!map.contains("grant_types")) {
+        var grants = std.json.Array.init(a);
+        try grants.append(.{ .string = "authorization_code" });
+        try grants.append(.{ .string = "refresh_token" });
+        try map.put("grant_types", .{ .array = grants });
+    }
+    if (!map.contains("response_types")) {
+        var rts = std.json.Array.init(a);
+        try rts.append(.{ .string = "code" });
+        try map.put("response_types", .{ .array = rts });
+    }
+    if (!map.contains("token_endpoint_auth_method")) try map.put("token_endpoint_auth_method", .{ .string = "none" });
+
+    var redirects = std.json.Array.init(a);
+    try redirects.append(.{ .string = redirect_uri });
+    try map.put("redirect_uris", .{ .array = redirects });
+
+    // Serialized BEFORE the arena dies; the result is alloc-owned.
+    return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = map }, .{});
 }

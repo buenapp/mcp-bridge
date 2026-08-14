@@ -210,6 +210,42 @@ test "oauth: parseWwwAuthenticateAttr token boundaries (insufficient_scope step-
     try std.testing.expectEqualStrings("openid", oauth.parseWwwAuthenticateAttr("Bearer scope=openid, realm=\"x\"", "scope").?);
 }
 
+test "oauth: buildRegistrationBody defaults and static overlay" {
+    const alloc = std.testing.allocator;
+
+    // Defaults only — same shape as before the overlay feature.
+    const d = try oauth.buildRegistrationBody(alloc, "http://localhost:1234/callback", null);
+    defer alloc.free(d);
+    const dp = try std.json.parseFromSlice(std.json.Value, alloc, d, .{});
+    defer dp.deinit();
+    const dobj = dp.value.object;
+    try std.testing.expectEqualStrings("mcp-bridge", dobj.get("client_name").?.string);
+    try std.testing.expectEqualStrings("http://localhost:1234/callback", dobj.get("redirect_uris").?.array.items[0].string);
+    try std.testing.expectEqualStrings("none", dobj.get("token_endpoint_auth_method").?.string);
+    try std.testing.expectEqual(@as(usize, 2), dobj.get("grant_types").?.array.items.len);
+
+    // Static overlay: client_name + custom fields win, redirect_uris is
+    // forced to ours, missing defaults are filled.
+    const s = try oauth.buildRegistrationBody(alloc, "http://localhost:9/callback",
+        \\{"client_name":"acme-ide","scope":"openid acme","logo_uri":"https://acme.example/logo.png","redirect_uris":["https://evil.example/x"]}
+    );
+    defer alloc.free(s);
+    const sp = try std.json.parseFromSlice(std.json.Value, alloc, s, .{});
+    defer sp.deinit();
+    const sobj = sp.value.object;
+    try std.testing.expectEqualStrings("acme-ide", sobj.get("client_name").?.string);
+    try std.testing.expectEqualStrings("openid acme", sobj.get("scope").?.string);
+    try std.testing.expectEqualStrings("https://acme.example/logo.png", sobj.get("logo_uri").?.string);
+    const ru = sobj.get("redirect_uris").?.array;
+    try std.testing.expectEqual(@as(usize, 1), ru.items.len);
+    try std.testing.expectEqualStrings("http://localhost:9/callback", ru.items[0].string);
+    try std.testing.expectEqualStrings("none", sobj.get("token_endpoint_auth_method").?.string);
+
+    // Non-object static metadata is rejected.
+    try std.testing.expectError(error.BadResponse, oauth.buildRegistrationBody(alloc, "http://x/cb", "[1,2]"));
+    try std.testing.expectError(error.BadResponse, oauth.buildRegistrationBody(alloc, "http://x/cb", "\"str\""));
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
