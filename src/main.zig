@@ -36,11 +36,15 @@ const oauth = @import("oauth.zig");
 const pkce = @import("pkce.zig");
 const loopback = @import("oauth_loopback.zig");
 const oauth_lock = @import("oauth_lock.zig");
+const ulog = @import("ulog.zig");
 const config_file = @import("config.zig");
 const evport = @import("evport.zig");
 const httpc = @import("httpc.zig");
 
 const log = std.log.scoped(.bridge);
+
+/// Route std.log through the ulog channel so --silent/--debug apply.
+pub const std_options: std.Options = .{ .logFn = ulog.stdLogFn };
 
 const Target = http.Target;
 
@@ -99,6 +103,10 @@ pub const Config = struct {
     url: []const u8 = "",
     headers: std.ArrayList([]const u8) = .empty,
     verbose: bool = false,
+    /// --silent: nothing on stderr (the debug file still records all).
+    silent: bool = false,
+    /// --debug: append all diagnostics to <tokens_dir>/<hash>_debug.log.
+    debug: bool = false,
     oauth: ?OAuthCfg = null, // non-null: OAuth enabled for this server
     transport: TransportStrategy = .http_first,
 };
@@ -111,6 +119,8 @@ fn usage() noreturn {
         \\  --header "Name: Value"  extra request header (repeatable)
         \\  --transport T           http-first (default) | http-only | sse-first | sse-only
         \\  --verbose               diagnostics on stderr
+        \\  --silent                suppress all stderr output (IDE-quiet)
+        \\  --debug                 append full diagnostics to <tokens-dir>/<hash>_debug.log
         \\
         \\OAuth 2.1 (auto-activates on a 401 even without flags):
         \\  --oauth                 enable OAuth for this server
@@ -671,7 +681,7 @@ pub const Bridge = struct {
             self.writeTransportError(mcp.getRequestId(line), @errorName(err));
             return;
         }
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: >> {s}\n", .{line});
+        ulog.vprint("mcp-bridge: >> {s}\n", .{line});
         if (self.probe_via_get and !self.probed) {
             // sse_first probe in flight: queue until the transport resolves.
             const owned = self.alloc.dupe(u8, line) catch return;
@@ -726,12 +736,12 @@ pub const Bridge = struct {
                 if (self.push_last_event_id) |old| self.alloc.free(old);
                 self.push_last_event_id = self.alloc.dupe(u8, id) catch null;
             }
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [push] << {s}\n", .{ev.data});
+            ulog.vprint("mcp-bridge: [push] << {s}\n", .{ev.data});
             self.out.writeLine(ev.data);
         } else {
             // Non-matching event inside a POST's SSE response: a
             // server-pushed message (e.g. sampling request) — forward it.
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] << {s}\n", .{ev.data});
+            ulog.vprint("mcp-bridge: [sse] << {s}\n", .{ev.data});
             self.out.writeLine(ev.data);
         }
     }
@@ -741,11 +751,11 @@ pub const Bridge = struct {
         if (conn == self.leg_conn) {
             self.onLegacyStreamEnd(conn, err);
         } else if (conn == self.push_conn) {
-            if (self.cfg.verbose and !self.stdin_eof) std.debug.print("mcp-bridge: [push] stream lost\n", .{});
+            if (!self.stdin_eof) ulog.vprint("mcp-bridge: [push] stream lost\n", .{});
             self.push_dead = true;
             conn.close();
         } else if (conn == self.delete_conn) {
-            if (err == null and self.cfg.verbose) std.debug.print("mcp-bridge: session terminated via DELETE\n", .{});
+            if (err == null) ulog.vprint("mcp-bridge: session terminated via DELETE\n", .{});
             conn.close();
         } else if (conn == self.idle_conn) {
             // Idle keep-alive conn ended (server closed or protocol junk).
@@ -837,7 +847,7 @@ pub const Bridge = struct {
             defer if (line) |l| self.alloc.free(l);
             conn.close();
             if (line == null) return;
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] 401 received, running OAuth\n", .{});
+            ulog.vprint("mcp-bridge: [oauth] 401 received, running OAuth\n", .{});
             if (self.tokens != null)
                 self.reauthOn401(wa) catch |err| {
                     self.writeTransportError(mcp.getRequestId(line.?), @errorName(err));
@@ -858,11 +868,11 @@ pub const Bridge = struct {
         // line itself) is resent once the endpoint event arrives.
         if (r.status == 404 or r.status == 405) {
             if (!self.probed and self.cfg.transport == .http_first) {
-                if (self.cfg.verbose) std.debug.print("mcp-bridge: POST -> {d}, trying legacy SSE transport\n", .{r.status});
+                ulog.vprint("mcp-bridge: POST -> {d}, trying legacy SSE transport\n", .{r.status});
                 self.mode = .legacy;
                 self.probed = true;
                 self.startLegacyTransport(false);
-                if (self.cfg.verbose) std.debug.print("mcp-bridge: switched to legacy SSE transport\n", .{});
+                ulog.vprint("mcp-bridge: switched to legacy SSE transport\n", .{});
             }
             if (self.mode == .legacy) {
                 const line = if (conn.role.post.line) |l| self.alloc.dupe(u8, l) catch null else null;
@@ -881,7 +891,7 @@ pub const Bridge = struct {
             var msg_buf: [64]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "HTTP {d}", .{r.status}) catch "HTTP error";
             self.writeTransportError(mcp.getRequestId(if (conn.role.post.line) |l| l else ""), msg);
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: << {d} non-JSON-RPC body, synthesized error\n", .{r.status});
+            ulog.vprint("mcp-bridge: << {d} non-JSON-RPC body, synthesized error\n", .{r.status});
             conn.close();
             return;
         }
@@ -892,15 +902,15 @@ pub const Bridge = struct {
             if (copy) |c| {
                 if (self.session_id) |old| self.alloc.free(old);
                 self.session_id = c;
-                if (self.cfg.verbose) std.debug.print("mcp-bridge: session {s}\n", .{sid});
+                ulog.vprint("mcp-bridge: session {s}\n", .{sid});
             }
         }
 
         if (r.body.len > 0) {
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: << {d} {s}\n", .{ r.status, r.body });
+            ulog.vprint("mcp-bridge: << {d} {s}\n", .{ r.status, r.body });
             self.out.writeLine(r.body);
-        } else if (self.cfg.verbose) {
-            std.debug.print("mcp-bridge: << {d} (no body)\n", .{r.status});
+        } else {
+            ulog.vprint("mcp-bridge: << {d} (no body)\n", .{r.status});
         }
 
         // Keep-alive JSON conns return to the idle pool (never mid-
@@ -940,7 +950,7 @@ pub const Bridge = struct {
                 conn.close();
                 if (owned) |l| {
                     defer self.alloc.free(l);
-                    if (self.cfg.verbose) std.debug.print("mcp-bridge: stale connection ({s}), retrying once on fresh connection\n", .{@errorName(e)});
+                    ulog.vprint("mcp-bridge: stale connection ({s}), retrying once on fresh connection\n", .{@errorName(e)});
                     self.streamableSendLine(l, conn_auth_retried(conn), true);
                 }
                 return;
@@ -1034,12 +1044,12 @@ pub const Bridge = struct {
         self.push_dead = false;
         self.push_auth_retried = auth_retried;
         self.trackConn(conn);
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [push] GET stream opening\n", .{});
+        ulog.vprint("mcp-bridge: [push] GET stream opening\n", .{});
     }
 
     fn onPushStreamHead(self: *Bridge, conn: *httpc.Conn, status: u16, is_sse: bool, www_authenticate: ?[]const u8) void {
         if (status == 404 or status == 405) {
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [push] server has no GET stream ({d})\n", .{status});
+            ulog.vprint("mcp-bridge: [push] server has no GET stream ({d})\n", .{status});
             self.push_unsupported = true;
             conn.close();
             return;
@@ -1066,13 +1076,13 @@ pub const Bridge = struct {
             return;
         }
         if (status != 200 or !is_sse) {
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [push] HTTP {d} (sse={})\n", .{ status, is_sse });
+            ulog.vprint("mcp-bridge: [push] HTTP {d} (sse={})\n", .{ status, is_sse });
             self.push_dead = true;
             conn.close();
             return;
         }
         conn.proceedStream();
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [push] GET stream open\n", .{});
+        ulog.vprint("mcp-bridge: [push] GET stream open\n", .{});
     }
 
     // ------------------------------------------------- legacy SSE ----
@@ -1116,16 +1126,16 @@ pub const Bridge = struct {
         self.leg_ready = false;
         self.leg_auth_retried = auth_retried;
         self.trackConn(conn);
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] event stream connecting\n", .{});
+        ulog.vprint("mcp-bridge: [sse] event stream connecting\n", .{});
     }
 
     fn onLegacyStreamHead(self: *Bridge, conn: *httpc.Conn, status: u16, is_sse: bool, www_authenticate: ?[]const u8) void {
         if (status == 404 or status == 405) {
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] GET {s} -> {d} (no event stream)\n", .{ self.cfg.target.path, status });
+            ulog.vprint("mcp-bridge: [sse] GET {s} -> {d} (no event stream)\n", .{ self.cfg.target.path, status });
             conn.close();
             if (self.probe_via_get and !self.probed) {
                 // sse_first: no event stream here — commit to Streamable HTTP.
-                if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] no event stream, using Streamable HTTP\n", .{});
+                ulog.vprint("mcp-bridge: [sse] no event stream, using Streamable HTTP\n", .{});
                 self.probe_via_get = false;
                 self.mode = .streamable;
                 self.probed = true;
@@ -1140,7 +1150,7 @@ pub const Bridge = struct {
             defer if (wa) |h| self.alloc.free(h);
             conn.close();
             self.leg_conn = null;
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] 401 on GET stream, running OAuth\n", .{});
+            ulog.vprint("mcp-bridge: [sse] 401 on GET stream, running OAuth\n", .{});
             if (self.tokens != null)
                 self.reauthOn401(wa) catch |err| {
                     self.legacyFailed(err);
@@ -1156,7 +1166,7 @@ pub const Bridge = struct {
             return;
         }
         if (status != 200 or !is_sse) {
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] GET stream -> HTTP {d} (sse={})\n", .{ status, is_sse });
+            ulog.vprint("mcp-bridge: [sse] GET stream -> HTTP {d} (sse={})\n", .{ status, is_sse });
             log.err("event stream endpoint returned HTTP {d}", .{status});
             conn.close();
             self.legacyFailed(error.SseEndpointUnavailable);
@@ -1181,7 +1191,7 @@ pub const Bridge = struct {
         if (mcp.getRequestId(ev.data)) |rid| {
             if (self.leg_pending.fetchRemove(rid)) |kv| self.alloc.free(kv.key);
         }
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] << {s}\n", .{ev.data});
+        ulog.vprint("mcp-bridge: [sse] << {s}\n", .{ev.data});
         self.out.writeLine(ev.data);
         self.maybeCloseLegacyAtShutdown();
     }
@@ -1224,7 +1234,7 @@ pub const Bridge = struct {
         }
         const target = http.parseUrl(abs) catch {
             self.alloc.free(abs);
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] bad endpoint URL '{s}'\n", .{url_data});
+            ulog.vprint("mcp-bridge: [sse] bad endpoint URL '{s}'\n", .{url_data});
             // Without an endpoint the transport is unusable.
             self.legacyFailed(error.SseEndpointUnavailable);
             return;
@@ -1241,7 +1251,7 @@ pub const Bridge = struct {
             self.mode = .legacy;
             self.probed = true;
         }
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] endpoint: {s}\n", .{abs});
+        ulog.vprint("mcp-bridge: [sse] endpoint: {s}\n", .{abs});
         self.flushQueueAsLegacy();
     }
 
@@ -1270,7 +1280,7 @@ pub const Bridge = struct {
     fn onLegacyStreamEnd(self: *Bridge, conn: *httpc.Conn, err: ?anyerror) void {
         conn.close();
         const e = err orelse error.SseEndpointUnavailable;
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] event stream lost\n", .{});
+        ulog.vprint("mcp-bridge: [sse] event stream lost\n", .{});
         self.leg_dead = true;
         self.leg_ready = false;
         self.failPending(e);
@@ -1391,7 +1401,7 @@ pub const Bridge = struct {
         // Cross-origin endpoints get their own verifier.
         if (ep.secure) {
             self.setupConnVerifier(conn, ep) catch |err| {
-                if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] verifier init failed: {s}\n", .{@errorName(err)});
+                ulog.vprint("mcp-bridge: [sse] verifier init failed: {s}\n", .{@errorName(err)});
                 conn.close();
                 if (rid != null and is_request) {
                     if (self.leg_pending.fetchRemove(rid.?)) |kv| self.alloc.free(kv.key);
@@ -1413,7 +1423,7 @@ pub const Bridge = struct {
                 return;
             }
         }
-        conn.owned_verifier = try platform.Verifier.init(self.alloc, t.host, t.port, self.cfg.verbose);
+        conn.owned_verifier = try platform.Verifier.init(self.alloc, t.host, t.port);
     }
 
     /// The legacy POST's HTTP response: 2xx = accepted (the JSON-RPC
@@ -1450,7 +1460,7 @@ pub const Bridge = struct {
             return; // accepted; the response arrives on the event stream
         }
 
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [sse] POST rejected: HTTP {d}\n", .{r.status});
+        ulog.vprint("mcp-bridge: [sse] POST rejected: HTTP {d}\n", .{r.status});
         const line = conn.role.post.line;
         self.legacyPostFailed(if (line) |l| l else "", "SsePostRejected");
         conn.close();
@@ -1560,7 +1570,7 @@ pub const Bridge = struct {
             if (std.mem.eql(u8, fresh.access_token, cur.access_token)) return false;
         }
         self.tokens = fresh;
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] adopted tokens refreshed by another instance\n", .{});
+        ulog.vprint("mcp-bridge: [oauth] adopted tokens refreshed by another instance\n", .{});
         return true;
     }
 
@@ -1571,8 +1581,8 @@ pub const Bridge = struct {
         if (!self.tokens_loaded) {
             self.tokens_loaded = true;
             self.tokens = oauth.loadTokenCache(alloc, self.cfg.url, self.cacheResource()) catch null;
-            if (self.tokens != null and self.cfg.verbose)
-                std.debug.print("mcp-bridge: [oauth] loaded cached tokens\n", .{});
+            if (self.tokens != null)
+                ulog.vprint("mcp-bridge: [oauth] loaded cached tokens\n", .{});
         }
 
         if (self.tokens) |t| {
@@ -1581,7 +1591,7 @@ pub const Bridge = struct {
             if (t.refresh_token) |rt| {
                 if (self.refreshTokens(rt)) |_| return else |err| {
                     if (self.reloadCacheIfChanged()) return;
-                    if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] refresh failed ({s}), full flow\n", .{@errorName(err)});
+                    ulog.vprint("mcp-bridge: [oauth] refresh failed ({s}), full flow\n", .{@errorName(err)});
                 }
             }
         } else if (www_authenticate == null and self.cfg.oauth == null) {
@@ -1614,7 +1624,7 @@ pub const Bridge = struct {
         t.client_id = try self.alloc.dupe(u8, client_id);
         self.adoptTokens(t);
         try oauth.saveTokenCache(self.alloc, self.cfg.url, self.cacheResource(), self.tokens.?);
-        if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] token refreshed\n", .{});
+        ulog.vprint("mcp-bridge: [oauth] token refreshed\n", .{});
     }
 
     fn adoptTokens(self: *Bridge, t: oauth.TokenSet) void {
@@ -1651,7 +1661,7 @@ pub const Bridge = struct {
             t.client_id = cid;
             self.adoptTokens(t);
             try oauth.saveTokenCache(alloc, self.cfg.url, self.cacheResource(), self.tokens.?);
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] client-credentials token acquired\n", .{});
+            ulog.vprint("mcp-bridge: [oauth] client-credentials token acquired\n", .{});
             return;
         }
 
@@ -1688,12 +1698,12 @@ pub const Bridge = struct {
                             log.err("oauth lockfile: coordinating instance keeps failing", .{});
                             return error.OAuthLockContention;
                         }
-                        if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] another instance is authenticating; waiting for it\n", .{});
+                        ulog.vprint("mcp-bridge: [oauth] another instance is authenticating; waiting for it\n", .{});
                         if (loopback.waitForAuth(peer_port, 180_000) == .done) {
                             if (oauth.loadTokenCache(alloc, self.cfg.url, self.cacheResource()) catch null) |t| {
                                 if (!t.isExpired(std.time.timestamp())) {
                                     self.adoptTokens(t);
-                                    std.debug.print("mcp-bridge: [oauth] authorization completed by another instance, token adopted\n", .{});
+                                    ulog.print("mcp-bridge: [oauth] authorization completed by another instance, token adopted\n", .{});
                                     return;
                                 }
                             }
@@ -1708,7 +1718,7 @@ pub const Bridge = struct {
             if (oauth.loadTokenCache(alloc, self.cfg.url, self.cacheResource()) catch null) |t| {
                 if (!t.isExpired(std.time.timestamp())) {
                     self.adoptTokens(t);
-                    if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] tokens appeared while acquiring the lock; adopted\n", .{});
+                    ulog.vprint("mcp-bridge: [oauth] tokens appeared while acquiring the lock; adopted\n", .{});
                     return;
                 }
             }
@@ -1722,7 +1732,7 @@ pub const Bridge = struct {
                 log.err("no client_id configured and AS has no registration_endpoint (DCR)", .{});
                 return oauth.OAuthError.NoRegistrationEndpoint;
             };
-            if (self.cfg.verbose) std.debug.print("mcp-bridge: [oauth] registering client via DCR\n", .{});
+            ulog.vprint("mcp-bridge: [oauth] registering client via DCR\n", .{});
             break :blk try oauth.registerClient(alloc, reg_ep, redirect_uri);
         };
         defer if (cfg.client_id == null) alloc.free(client_id);
@@ -1742,9 +1752,9 @@ pub const Bridge = struct {
         const auth_url = try oauth.buildAuthUrl(alloc, authz_ep, client_id, redirect_uri, &challenge, &state, scope, resource);
         defer alloc.free(auth_url);
 
-        std.debug.print("mcp-bridge: authorize at:\n{s}\n", .{auth_url});
+        ulog.print("mcp-bridge: authorize at:\n{s}\n", .{auth_url});
         if (!loopback.openUrl(alloc, auth_url)) {
-            std.debug.print(
+            ulog.print(
                 "mcp-bridge: could not open a browser automatically; open the URL above manually.\n" ++
                     "mcp-bridge: over ssh, forward the callback port first: ssh -L {d}:localhost:{d} <this-host>\n",
                 .{ listener.port, listener.port },
@@ -1763,7 +1773,7 @@ pub const Bridge = struct {
         try oauth.saveTokenCache(alloc, self.cfg.url, self.cacheResource(), self.tokens.?);
         // Tokens are on disk — NOW release the waiting second instances.
         listener.completeWaiters();
-        std.debug.print("mcp-bridge: [oauth] authorization complete, token cached\n", .{});
+        ulog.print("mcp-bridge: [oauth] authorization complete, token cached\n", .{});
     }
 
     /// Inject the bearer token header when we hold one. `auth_hdr` is owned
@@ -1824,6 +1834,10 @@ pub fn main() !void {
         const a = args[i];
         if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
             cfg.verbose = true;
+        } else if (std.mem.eql(u8, a, "--silent")) {
+            cfg.silent = true;
+        } else if (std.mem.eql(u8, a, "--debug")) {
+            cfg.debug = true;
         } else if (matchValueFlag(args, &i, "--header", "-H")) |m| {
             const v = switch (m) {
                 .missing => usage(),
@@ -1885,8 +1899,8 @@ pub fn main() !void {
     }
     cfg.target = parseUrl(url orelse usage()) catch usage();
     cfg.url = url.?;
-    platform.setVerbose(cfg.verbose);
-    oauth.verbose = cfg.verbose;
+    ulog.verbose = cfg.verbose;
+    ulog.silent = cfg.silent;
 
     // Config file (flags override file values)
     const cf_path = config_path orelse (config_file.defaultPath(alloc) catch null) orelse "";
@@ -1903,6 +1917,16 @@ pub fn main() !void {
     if (cf) |*c| file_sc = c.lookup(cfg.url);
 
     const resource: ?[]const u8 = oauth_resource orelse if (file_sc) |sc| sc.resource else null;
+
+    // --debug: full diagnostics (both classes, regardless of --verbose and
+    // --silent) appended to <tokens_dir>/<hash>_debug.log — the hash is the
+    // token-cache key, mcp-remote's ~/.mcp-auth/<hash>_debug.log analog.
+    if (cfg.debug) {
+        if (oauth.tokensDir(alloc) catch null) |d| {
+            if (oauth.pathInDir(alloc, d, cfg.url, resource, "_debug.log") catch null) |p|
+                ulog.openDebugFile(p);
+        }
+    }
     const transport_str: ?[]const u8 = transport_flag orelse if (file_sc) |sc| sc.transport else null;
     if (transport_str) |ts| {
         cfg.transport = TransportStrategy.parse(ts) orelse {
@@ -1921,7 +1945,7 @@ pub fn main() !void {
 
     if (oauth_logout) {
         try oauth.deleteTokenCache(alloc, cfg.url, resource);
-        std.debug.print("mcp-bridge: deleted cached tokens for {s}\n", .{cfg.url});
+        ulog.print("mcp-bridge: deleted cached tokens for {s}\n", .{cfg.url});
         return;
     }
 
@@ -1935,19 +1959,17 @@ pub fn main() !void {
         };
     }
 
-    if (cfg.verbose) {
-        std.debug.print("mcp-bridge: {s}://{s}:{d}{s}\n", .{
-            if (cfg.target.secure) "https" else "http",
-            cfg.target.host,
-            cfg.target.port,
-            cfg.target.path,
-        });
-    }
+    ulog.vprint("mcp-bridge: {s}://{s}:{d}{s}\n", .{
+        if (cfg.target.secure) "https" else "http",
+        cfg.target.host,
+        cfg.target.port,
+        cfg.target.path,
+    });
 
     // Verifier (TLS only)
     var verifier: ?platform.Verifier = null;
     if (cfg.target.secure) {
-        verifier = platform.Verifier.init(alloc, cfg.target.host, cfg.target.port, cfg.verbose) catch |err| {
+        verifier = platform.Verifier.init(alloc, cfg.target.host, cfg.target.port) catch |err| {
             log.err("verifier init failed: {s}", .{@errorName(err)});
             return err;
         };
@@ -1983,14 +2005,14 @@ pub fn main() !void {
     if (!has_auth_header and cfg.target.secure) {
         bridge.tokens = oauth.loadTokenCache(alloc, cfg.url, bridge.cacheResource()) catch null;
         bridge.tokens_loaded = true;
-        if (bridge.tokens != null and cfg.verbose)
-            std.debug.print("mcp-bridge: [oauth] using cached token\n", .{});
+        if (bridge.tokens != null)
+            ulog.vprint("mcp-bridge: [oauth] using cached token\n", .{});
     }
 
-    if (cfg.verbose) std.debug.print("mcp-bridge: event loop starting\n", .{});
+    ulog.vprint("mcp-bridge: event loop starting\n", .{});
     try bridge.run();
     bridge.shutdownStdio();
 
     if (bridge.fatal) |err| return err;
-    if (cfg.verbose) std.debug.print("mcp-bridge: stdin closed, exiting\n", .{});
+    ulog.vprint("mcp-bridge: stdin closed, exiting\n", .{});
 }

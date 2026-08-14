@@ -12,8 +12,10 @@ const dane = @import("dane.zig");
 const TlsaRecord = dane.TlsaRecord;
 const DaneResult = dane.DaneResult;
 
+const ulog = @import("ulog.zig");
+
 fn vprint(comptime fmt: []const u8, args: anytype) void {
-    if (dane.verbose) std.debug.print(fmt, args);
+    ulog.vprint(fmt, args);
 }
 
 fn hexEncode(alloc: std.mem.Allocator, data: []const u8) []u8 {

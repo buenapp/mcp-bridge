@@ -40,10 +40,10 @@ const C_IN: c_int = 1;
 const T_TLSA: c_int = 52;
 const MAX_RESPONSE = 4096;
 
-pub var verbose: bool = false;
+const ulog = @import("ulog.zig");
 
 fn vprint(comptime fmt: []const u8, args: anytype) void {
-    if (verbose) std.debug.print(fmt, args);
+    ulog.vprint(fmt, args);
 }
 
 pub const DnsError = error{

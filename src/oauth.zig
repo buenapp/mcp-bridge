@@ -13,11 +13,10 @@ const http = @import("http.zig");
 const syncreq = @import("syncreq.zig");
 
 const log = std.log.scoped(.oauth);
-
-pub var verbose: bool = false;
+const ulog = @import("ulog.zig");
 
 fn vprint(comptime fmt: []const u8, args: anytype) void {
-    if (verbose) std.debug.print(fmt, args);
+    ulog.vprint(fmt, args);
 }
 
 pub const OAuthError = error{
@@ -371,7 +370,7 @@ fn request(
     const t = try http.parseUrl(url);
     if (!t.secure) return OAuthError.DiscoveryFailed; // OAuth requires TLS
 
-    var verifier = try platform.Verifier.init(alloc, t.host, t.port, verbose);
+    var verifier = try platform.Verifier.init(alloc, t.host, t.port);
     return switch (method) {
         .get => try syncreq.request(alloc, "GET", t, "application/json", null, &.{}, null, &verifier),
         .post_form => try syncreq.request(alloc, "POST", t, "application/json", "application/x-www-form-urlencoded", &.{}, body.?, &verifier),

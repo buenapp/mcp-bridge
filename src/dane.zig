@@ -9,8 +9,6 @@
 
 const std = @import("std");
 
-pub var verbose: bool = false;
-
 pub const TlsaRecord = struct {
     usage: u8, // 2 = DANE-TA, 3 = DANE-EE (0/1 = PKIX-* also matched like Bloom)
     selector: u8, // 0 = CERT, 1 = SPKI

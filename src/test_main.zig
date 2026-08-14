@@ -9,6 +9,7 @@ const oauth = @import("oauth.zig");
 const config = @import("config.zig");
 const sse = @import("sse.zig");
 const evport = @import("evport.zig");
+const ulog = @import("ulog.zig");
 const test_transport = @import("test_transport.zig");
 
 comptime {
@@ -16,6 +17,7 @@ comptime {
     _ = config;
     _ = sse;
     _ = evport;
+    _ = ulog;
     _ = test_transport;
     // Backend tests live in the per-platform files; reference the ones for
     // this host so their tests are discovered.

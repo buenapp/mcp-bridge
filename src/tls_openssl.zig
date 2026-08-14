@@ -12,11 +12,10 @@ const openssl = @import("openssl.zig");
 
 const c = openssl.c;
 const log = std.log.scoped(.tls_openssl);
-
-pub var verbose: bool = false;
+const ulog = @import("ulog.zig");
 
 fn vprint(comptime fmt: []const u8, args: anytype) void {
-    if (verbose) std.debug.print(fmt, args);
+    ulog.vprint(fmt, args);
 }
 
 pub const TlsError = error{

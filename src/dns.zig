@@ -5,10 +5,10 @@ const std = @import("std");
 const win = @import("win.zig");
 const dane = @import("dane.zig");
 
-pub var verbose: bool = false;
+const ulog = @import("ulog.zig");
 
 fn vprint(comptime fmt: []const u8, args: anytype) void {
-    if (verbose) std.debug.print(fmt, args);
+    ulog.vprint(fmt, args);
 }
 
 pub const DnsError = error{

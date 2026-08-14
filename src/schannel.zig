@@ -12,11 +12,10 @@ const platform = @import("platform.zig");
 const nb = @import("nb_win.zig");
 
 const log = std.log.scoped(.tls_schannel);
-
-pub var verbose: bool = false;
+const ulog = @import("ulog.zig");
 
 fn vprint(comptime fmt: []const u8, args: anytype) void {
-    if (verbose) std.debug.print(fmt, args);
+    ulog.vprint(fmt, args);
 }
 
 pub const TlsError = error{
