@@ -107,6 +107,12 @@ pub const Config = struct {
     silent: bool = false,
     /// --debug: append all diagnostics to <tokens_dir>/<hash>_debug.log.
     debug: bool = false,
+    /// --auth-timeout: interactive flow callback wait (default 180s —
+    /// deliberately longer than mcp-remote's 30s: a human is in the loop).
+    auth_timeout_ms: u32 = 180_000,
+    /// --host: OAuth callback hostname for the redirect URI (default
+    /// "localhost"); the listener binds its first IPv4 resolution.
+    callback_host: ?[]const u8 = null,
     oauth: ?OAuthCfg = null, // non-null: OAuth enabled for this server
     transport: TransportStrategy = .http_first,
 };
@@ -121,6 +127,7 @@ fn usage() noreturn {
         \\  --verbose               diagnostics on stderr
         \\  --silent                suppress all stderr output (IDE-quiet)
         \\  --debug                 append full diagnostics to <tokens-dir>/<hash>_debug.log
+        \\  --auth-timeout SECS     OAuth browser-flow callback timeout (default 180)
         \\
         \\OAuth 2.1 (auto-activates on a 401 even without flags):
         \\  --oauth                 enable OAuth for this server
@@ -129,6 +136,8 @@ fn usage() noreturn {
         \\  --oauth-scope S         scopes to request
         \\  --oauth-grant G         authorization_code | client_credentials (default: auto)
         \\  --resource URI          RFC 8707 resource indicator (default: the server URL)
+        \\  --host NAME             OAuth callback host (default localhost; some
+        \\                          authorization servers reject "localhost" redirects)
         \\  --config PATH           JSON config file (default: ~/.config/mcp-bridge/config.json)
         \\  --oauth-logout          delete cached tokens for <url> and exit
         \\
@@ -1671,7 +1680,10 @@ pub const Bridge = struct {
             return oauth.OAuthError.NoAuthorizationServer;
         };
 
-        var listener = try loopback.Listener.init(180_000);
+        var listener = if (self.cfg.callback_host) |h|
+            try loopback.Listener.initHost(alloc, self.cfg.auth_timeout_ms, h)
+        else
+            try loopback.Listener.init(self.cfg.auth_timeout_ms);
         defer listener.deinit();
         // Held /wait-for-auth pollers get EOF on any failure exit (no-op
         // once completeWaiters has run).
@@ -1681,12 +1693,14 @@ pub const Bridge = struct {
         // mcp-bridge instance is mid-flow for the same server, wait for it
         // and adopt the tokens it caches instead of opening a second
         // browser tab. Windows skips this (mcp-remote parity).
+        // Probes use the configured callback host (default loopback).
+        const probe_host = self.cfg.callback_host orelse "127.0.0.1";
         var lock: ?oauth_lock.Lock = null;
         defer if (lock) |*l| l.release(alloc);
         if (comptime oauth_lock.is_supported) {
             var waits: u8 = 0;
             while (lock == null) {
-                const ar = oauth_lock.acquire(alloc, self.cfg.url, self.cacheResource(), listener.port) catch |err| {
+                const ar = oauth_lock.acquire(alloc, self.cfg.url, self.cacheResource(), listener.port, probe_host) catch |err| {
                     log.err("oauth lockfile: {s}", .{@errorName(err)});
                     return err;
                 };
@@ -1699,7 +1713,7 @@ pub const Bridge = struct {
                             return error.OAuthLockContention;
                         }
                         ulog.vprint("mcp-bridge: [oauth] another instance is authenticating; waiting for it\n", .{});
-                        if (loopback.waitForAuth(peer_port, 180_000) == .done) {
+                        if (loopback.waitForAuth(alloc, peer_port, self.cfg.auth_timeout_ms, probe_host) == .done) {
                             if (oauth.loadTokenCache(alloc, self.cfg.url, self.cacheResource()) catch null) |t| {
                                 if (!t.isExpired(std.time.timestamp())) {
                                     self.adoptTokens(t);
@@ -1838,6 +1852,27 @@ pub fn main() !void {
             cfg.silent = true;
         } else if (std.mem.eql(u8, a, "--debug")) {
             cfg.debug = true;
+        } else if (matchValueFlag(args, &i, "--auth-timeout", null)) |m| {
+            const v = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+            const secs = std.fmt.parseInt(u32, v, 10) catch {
+                log.err("invalid --auth-timeout '{s}' (positive seconds)", .{v});
+                usage();
+            };
+            if (secs == 0 or secs > 4_000_000) {
+                log.err("invalid --auth-timeout '{s}' (positive seconds)", .{v});
+                usage();
+            }
+            cfg.auth_timeout_ms = secs * 1000;
+        } else if (matchValueFlag(args, &i, "--host", null)) |m| {
+            cfg.callback_host = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
         } else if (matchValueFlag(args, &i, "--header", "-H")) |m| {
             const v = switch (m) {
                 .missing => usage(),

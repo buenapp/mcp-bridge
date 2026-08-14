@@ -52,15 +52,17 @@ pub const LockInfo = struct {
 
 /// Try to become the coordinating instance for this server's interactive
 /// flow. `port` is OUR loopback listener (already bound and accepting, so
-/// a waiter that sees the lock can connect immediately). POSIX only.
-pub fn acquire(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8, port: u16) LockError!AcquireResult {
+/// a waiter that sees the lock can connect immediately). `probe_host` is
+/// the callback host the listener bound (default loopback; a --host alias
+/// both instances share). POSIX only.
+pub fn acquire(alloc: std.mem.Allocator, server_url: []const u8, resource: ?[]const u8, port: u16, probe_host: []const u8) LockError!AcquireResult {
     const dir = oauth.tokensDir(alloc) catch return LockError.WriteFailed;
     defer alloc.free(dir);
-    return acquireIn(alloc, dir, server_url, resource, port);
+    return acquireIn(alloc, dir, server_url, resource, port, probe_host);
 }
 
 /// Dir-injectable core of acquire() (hermetic tests).
-pub fn acquireIn(alloc: std.mem.Allocator, dir: []const u8, server_url: []const u8, resource: ?[]const u8, port: u16) LockError!AcquireResult {
+pub fn acquireIn(alloc: std.mem.Allocator, dir: []const u8, server_url: []const u8, resource: ?[]const u8, port: u16, probe_host: []const u8) LockError!AcquireResult {
     const path = oauth.lockPathIn(alloc, dir, server_url, resource) catch return LockError.OutOfMemory;
     std.fs.cwd().makePath(dir) catch {};
 
@@ -69,7 +71,7 @@ pub fn acquireIn(alloc: std.mem.Allocator, dir: []const u8, server_url: []const 
         const f = std.fs.cwd().createFile(path, .{ .exclusive = true, .mode = 0o600 }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 if (readLock(alloc, path)) |info| {
-                    if (pidAlive(info.pid) and portAccepts(info.port)) {
+                    if (pidAlive(info.pid) and portAccepts(alloc, info.port, probe_host)) {
                         alloc.free(path);
                         return .{ .held_by_other = info.port };
                     }
@@ -92,7 +94,7 @@ pub fn acquireIn(alloc: std.mem.Allocator, dir: []const u8, server_url: []const 
                         }
                     }
                     if (info) |i| {
-                        if (pidAlive(i.pid) and portAccepts(i.port)) {
+                        if (pidAlive(i.pid) and portAccepts(alloc, i.port, probe_host)) {
                             alloc.free(path);
                             return .{ .held_by_other = i.port };
                         }
@@ -154,8 +156,19 @@ pub fn pidAlive(pid: i32) bool {
 /// A live lock's listener must accept connections: it is bound BEFORE the
 /// lock file is written. A refused connect therefore means the recorded
 /// pid was recycled by an unrelated process — the lock is stale.
-fn portAccepts(port: u16) bool {
-    const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
+fn portAccepts(alloc: std.mem.Allocator, port: u16, host: []const u8) bool {
+    const addr = std.net.Address.parseIp4(host, port) catch blk: {
+        const list = std.net.getAddressList(alloc, host, port) catch return false;
+        defer list.deinit();
+        var first: ?std.net.Address = null;
+        for (list.addrs) |a| {
+            if (a.any.family == std.posix.AF.INET) {
+                first = a;
+                break;
+            }
+        }
+        break :blk first orelse return false;
+    };
     const s = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return false;
     defer std.posix.close(s);
     std.posix.connect(s, &addr.any, addr.getOsSockLen()) catch return false;
@@ -206,13 +219,13 @@ test "lockfile: acquire free, contention with live pid, release" {
     var sock: std.posix.fd_t = undefined;
     const port = try testListener(&sock);
     defer std.posix.close(sock);
-    var l1 = switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port)) {
+    var l1 = switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port, "127.0.0.1")) {
         .acquired => |l| l,
         .held_by_other => return error.TestUnexpectedResult,
     };
 
     // Held by a live pid (ours) with an accepting port → held_by_other.
-    switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port)) {
+    switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port, "127.0.0.1")) {
         .acquired => return error.TestUnexpectedResult,
         .held_by_other => |p| try std.testing.expectEqual(port, p),
     }
@@ -222,7 +235,7 @@ test "lockfile: acquire free, contention with live pid, release" {
     const lock_path = try oauth.lockPathIn(alloc, dir, "https://a.example/mcp", null);
     defer alloc.free(lock_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(lock_path, .{}));
-    var l2 = switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port)) {
+    var l2 = switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port, "127.0.0.1")) {
         .acquired => |l| l,
         .held_by_other => return error.TestUnexpectedResult,
     };
@@ -248,7 +261,7 @@ test "lockfile: stale lock (dead pid) is taken over" {
     var sock2: std.posix.fd_t = undefined;
     const port = try testListener(&sock2);
     defer std.posix.close(sock2);
-    var l = switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port)) {
+    var l = switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port, "127.0.0.1")) {
         .acquired => |l| l,
         .held_by_other => return error.TestUnexpectedResult,
     };
@@ -276,7 +289,7 @@ test "lockfile: corrupt lock is taken over" {
     var sock: std.posix.fd_t = undefined;
     const port = try testListener(&sock);
     defer std.posix.close(sock);
-    var l = switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port)) {
+    var l = switch (try acquireIn(alloc, dir, "https://a.example/mcp", null, port, "127.0.0.1")) {
         .acquired => |l| l,
         .held_by_other => return error.TestUnexpectedResult,
     };

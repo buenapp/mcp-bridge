@@ -40,6 +40,9 @@ pub const Listener = struct {
     sock: ConnFd,
     port: u16,
     timeout_ms: u32,
+    /// Hostname used in the redirect URI (--host; default "localhost").
+    /// The bind address is the host's first IPv4 resolution.
+    display_host: []const u8 = "localhost",
     /// Per-conn read cap so an idle conn cannot stall the flow (tests
     /// shrink this).
     conn_timeout_ms: u32 = 10_000,
@@ -69,18 +72,43 @@ pub const Listener = struct {
 
     /// Bind 127.0.0.1:0 (OS-assigned port) with an accept timeout.
     pub fn init(timeout_ms: u32) LoopbackError!Listener {
-        if (is_windows) return initWin(timeout_ms);
-        return initPosix(timeout_ms);
+        if (is_windows) return initWin(defaultBindAddr(), timeout_ms);
+        return initPosix(defaultBindAddr(), timeout_ms);
+    }
+
+    /// --host variant: the redirect URI uses `host` and the listener binds
+    /// the host's first IPv4 resolution (loopback aliases included — that
+    /// is the intended case: authorization servers that reject a bare
+    /// "localhost" redirect).
+    pub fn initHost(alloc: std.mem.Allocator, timeout_ms: u32, host: []const u8) LoopbackError!Listener {
+        const addr = resolveV4(alloc, host, 0) catch return LoopbackError.ListenFailed;
+        var l = if (is_windows) try initWin(addr, timeout_ms) else try initPosix(addr, timeout_ms);
+        l.display_host = host;
+        return l;
+    }
+
+    fn defaultBindAddr() std.net.Address {
+        return std.net.Address.parseIp4("127.0.0.1", 0) catch unreachable;
+    }
+
+    /// First IPv4 address `host` resolves to (literal IPs included).
+    pub fn resolveV4(alloc: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
+        const list = std.net.getAddressList(alloc, host, port) catch return error.ResolveFailed;
+        defer list.deinit();
+        for (list.addrs) |a| {
+            if (a.any.family == std.posix.AF.INET) return a;
+        }
+        return error.ResolveFailed;
     }
 
     pub fn deinit(self: *Listener) void {
         sockClose(self.sock);
     }
 
-    /// Redirect URI to register/send: http://localhost:<port>/callback
+    /// Redirect URI to register/send: http://<display_host>:<port>/callback
     /// ("localhost" is what the IDE's port forwarding terminates).
     pub fn redirectUri(self: *const Listener, alloc: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(alloc, "http://localhost:{d}/callback", .{self.port});
+        return std.fmt.allocPrint(alloc, "http://{s}:{d}/callback", .{ self.display_host, self.port });
     }
 
     /// Accept connections until the authorization redirect arrives (or the
@@ -202,8 +230,7 @@ pub const Listener = struct {
 
     // ------------------------------------------------------- platform io --
 
-    fn initPosix(timeout_ms: u32) LoopbackError!Listener {
-        const addr = std.net.Address.parseIp4("127.0.0.1", 0) catch unreachable;
+    fn initPosix(addr: std.net.Address, timeout_ms: u32) LoopbackError!Listener {
         const s = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch
             return LoopbackError.ListenFailed;
         errdefer std.posix.close(s);
@@ -212,17 +239,16 @@ pub const Listener = struct {
         std.posix.listen(s, 8) catch return LoopbackError.ListenFailed;
         setSockTimeout(s, timeout_ms);
 
-        var bound = std.net.Address.parseIp4("127.0.0.1", 0) catch unreachable;
+        var bound = defaultBindAddr();
         var blen: std.posix.socklen_t = bound.getOsSockLen();
         std.posix.getsockname(s, &bound.any, &blen) catch return LoopbackError.ListenFailed;
         return .{ .sock = s, .port = bound.getPort(), .timeout_ms = timeout_ms };
     }
 
-    fn initWin(timeout_ms: u32) LoopbackError!Listener {
+    fn initWin(addr: std.net.Address, timeout_ms: u32) LoopbackError!Listener {
         var wsa: win.ws2.WSADATA = undefined;
         if (win.ws2.WSAStartup(0x0202, &wsa) != 0) return LoopbackError.ListenFailed;
 
-        const addr = std.net.Address.parseIp4("127.0.0.1", 0) catch unreachable;
         const s = win.ws2.socket(addr.any.family, win.ws2.SOCK.STREAM, 0);
         if (s == win.INVALID_SOCKET) return LoopbackError.ListenFailed;
         errdefer _ = win.ws2.closesocket(s);
@@ -233,7 +259,7 @@ pub const Listener = struct {
         if (win.ws2.listen(s, 8) != 0) return LoopbackError.ListenFailed;
         setSockTimeout(s, timeout_ms);
 
-        var bound = std.net.Address.parseIp4("127.0.0.1", 0) catch unreachable;
+        var bound = defaultBindAddr();
         var blen: i32 = @intCast(bound.getOsSockLen());
         if (win.ws2.getsockname(s, &bound.any, &blen) != 0) return LoopbackError.ListenFailed;
         return .{ .sock = s, .port = bound.getPort(), .timeout_ms = timeout_ms };
@@ -284,9 +310,10 @@ pub const WaitResult = enum { done, failed };
 /// Long-poll a peer instance's loopback listener (issue #3): block until
 /// its interactive flow completes (200) or the connection drops / times
 /// out. The peer's accept timeout bounds its flow, so timeout_ms should
-/// match it.
-pub fn waitForAuth(port: u16, timeout_ms: u32) WaitResult {
-    const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
+/// match it. `host` is the callback host the peer bound (default loopback;
+/// a --host alias both instances share).
+pub fn waitForAuth(alloc: std.mem.Allocator, port: u16, timeout_ms: u32, host: []const u8) WaitResult {
+    const addr = Listener.resolveV4(alloc, host, port) catch return .failed;
 
     var conn: ConnFd = undefined;
     if (is_windows) {
@@ -586,8 +613,31 @@ test "waitForCode: stray conns are dropped without failing the flow" {
     try std.testing.expect(std.mem.startsWith(u8, buf[0..fav_len], "HTTP/1.1 404"));
 }
 
+test "initHost: display host in redirect URI, loopback alias binds" {
+    if (comptime is_windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var l = try Listener.initHost(alloc, 5_000, "127.0.0.1");
+    defer l.deinit();
+    const uri = try l.redirectUri(alloc);
+    defer alloc.free(uri);
+    try std.testing.expectEqualStrings("http://127.0.0.1:", uri[0.."http://127.0.0.1:".len]);
+
+    // "localhost" resolves to a loopback bind.
+    var l2 = try Listener.initHost(alloc, 5_000, "localhost");
+    defer l2.deinit();
+    try std.testing.expect(l2.port != 0);
+    const uri2 = try l2.redirectUri(alloc);
+    defer alloc.free(uri2);
+    try std.testing.expect(std.mem.startsWith(u8, uri2, "http://localhost:"));
+
+    // Unresolvable host fails cleanly.
+    try std.testing.expectError(LoopbackError.ListenFailed, Listener.initHost(alloc, 5_000, "no-such-host.invalid"));
+}
+
 test "waitForAuth: done on 200, failed on drop, failed on refused" {
     if (comptime is_windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
 
     // Mini server thread: answer 200 once.
     const Srv = struct {
@@ -607,18 +657,18 @@ test "waitForAuth: done on 200, failed on drop, failed on refused" {
     var l1 = try Listener.init(10_000);
     defer l1.deinit();
     const t1 = try std.Thread.spawn(.{}, Srv.answer200, .{&l1});
-    try std.testing.expectEqual(WaitResult.done, waitForAuth(l1.port, 5_000));
+    try std.testing.expectEqual(WaitResult.done, waitForAuth(alloc, l1.port, 5_000, "127.0.0.1"));
     t1.join();
 
     var l2 = try Listener.init(10_000);
     defer l2.deinit();
     const t2 = try std.Thread.spawn(.{}, Srv.drop, .{&l2});
-    try std.testing.expectEqual(WaitResult.failed, waitForAuth(l2.port, 5_000));
+    try std.testing.expectEqual(WaitResult.failed, waitForAuth(alloc, l2.port, 5_000, "127.0.0.1"));
     t2.join();
 
     // Nothing listening → connect refused → failed.
     var l3 = try Listener.init(10_000);
     const refused_port = l3.port;
     l3.deinit();
-    try std.testing.expectEqual(WaitResult.failed, waitForAuth(refused_port, 1_000));
+    try std.testing.expectEqual(WaitResult.failed, waitForAuth(alloc, refused_port, 1_000, "127.0.0.1"));
 }
