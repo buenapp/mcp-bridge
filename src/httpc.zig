@@ -321,6 +321,7 @@ pub const Conn = struct {
     tunnel_req: [1024]u8 = undefined, // CONNECT request bytes
     tunnel_req_len: usize = 0,
     tunnel_wpos: usize = 0,
+    tunnel_blocked: bool = false, // last tunnel writeNb said want_write
     tunnel_buf: [4096]u8 = undefined, // CONNECT response head
     tunnel_len: usize = 0,
 
@@ -338,11 +339,16 @@ pub const Conn = struct {
         line: ?[]const u8,
         verifier: ?*platform.Verifier,
     ) Error!*Conn {
-        const eid: ?[]u8 = if (expect_id) |e| alloc.dupe(u8, e) catch return Error.OutOfMemory else null;
-        errdefer if (eid) |e| alloc.free(e);
-        const ln: ?[]u8 = if (line) |l| alloc.dupe(u8, l) catch return Error.OutOfMemory else null;
-        errdefer if (ln) |l| alloc.free(l);
-        return start(alloc, evp, handler, target, request, .{ .post = .{ .expect_id = eid, .line = ln } }, verifier);
+        // Dupes are owned by the block only until the role is assembled;
+        // on start() failure its own errdefer (deinitMem) frees them.
+        const role = blk: {
+            const eid: ?[]u8 = if (expect_id) |e| alloc.dupe(u8, e) catch return Error.OutOfMemory else null;
+            errdefer if (eid) |e| alloc.free(e);
+            const ln: ?[]u8 = if (line) |l| alloc.dupe(u8, l) catch return Error.OutOfMemory else null;
+            errdefer if (ln) |l| alloc.free(l);
+            break :blk Role{ .post = .{ .expect_id = eid, .line = ln } };
+        };
+        return start(alloc, evp, handler, target, request, role, verifier);
     }
 
     /// Create + start a long-lived GET stream conn.
@@ -580,9 +586,14 @@ pub const Conn = struct {
     /// response head, then hand off to the TLS handshake (origin SNI and
     /// verification are unaffected — the tunnel is transparent TCP).
     fn driveProxyTunnel(self: *Conn) bool {
-        // Write phase (plain stream: no TLS want_read interplay).
+        // Write phase (plain stream: no TLS want_read interplay). ATTEMPT
+        // the write first — the socket is writable right after connect.
+        // Gating the first write on a fresh writable edge deadlocks on
+        // epoll: EPOLLET there covers the fd's whole registration, so a
+        // still-writable socket never produces a second EPOLLOUT edge.
+        // Only an actual want_write waits (driveWrite has the same rule).
         while (self.tunnel_wpos < self.tunnel_req_len) {
-            if (!platform.is_windows and !self.write_ready) {
+            if (!platform.is_windows and self.tunnel_blocked and !self.write_ready) {
                 self.armWrite();
                 return false;
             }
@@ -591,8 +602,12 @@ pub const Conn = struct {
                 return true;
             };
             switch (r) {
-                .done => |n| self.tunnel_wpos += n,
+                .done => |n| {
+                    self.tunnel_wpos += n;
+                    self.tunnel_blocked = false;
+                },
                 .want_write => {
+                    self.tunnel_blocked = true;
                     self.write_ready = false;
                     self.armWrite();
                     return false;

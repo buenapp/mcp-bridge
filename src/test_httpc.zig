@@ -372,7 +372,12 @@ test "httpc post: connect failure surfaces via onEnd" {
 
     const line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
     const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "application/json, text/event-stream", "application/json", &.{}, line);
-    const conn = try httpc.Conn.startPost(alloc, &evp, hnd, target, req, "1", line, null);
+    // Loopback refusal is timing-dependent: connect() may fail
+    // synchronously (startPost errors) instead of EINPROGRESS-then-onEnd.
+    const conn = httpc.Conn.startPost(alloc, &evp, hnd, target, req, "1", line, null) catch |err| {
+        try std.testing.expectEqual(httpc.Error.ConnectFailed, err);
+        return;
+    };
     try runToDone(&evp, &ctx);
     reap(conn);
 

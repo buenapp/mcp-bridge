@@ -442,18 +442,19 @@ test "streamable: server request inside a POST SSE stream is answered (no deadlo
 fn mockProxyTunnelMain(mock: *Mock) void {
     const alloc = mock.alloc;
     var c1 = mock.server.accept() catch return;
-    defer sockClose(&c1.stream);
+    // NOTE: c1 is deliberately left OPEN at return (no sockClose): the
+    // bridge holds the tunnel mid-handshake until ITS deinit; an early
+    // close here EOFs the handshake and the tls layer error-logs, which
+    // fails the test run. The fd dies with the process.
     var req = readRequest(alloc, &c1.stream) catch return;
     defer req.deinit(alloc);
     mock.answer_seen = std.mem.indexOf(u8, req.head, "CONNECT origin.example:443 HTTP/1.1") != null and
         std.mem.indexOf(u8, req.head, "Proxy-Authorization: Basic dTpw") != null;
     writeAll(&c1.stream, "HTTP/1.1 200 Connection established\r\n\r\n") catch return;
-    // The TLS ClientHello arrives through the tunnel.
+    // The TLS ClientHello arrives through the tunnel; then our job is done.
     var buf: [512]u8 = undefined;
     const n = sockRead(&c1.stream, &buf) catch 0;
     mock.extra = n;
-    // Hold open; the bridge's deinit closes us.
-    drainUntilClose(&c1.stream);
 }
 
 test "proxy: https target tunnels via CONNECT with proxy auth" {
@@ -463,6 +464,8 @@ test "proxy: https target tunnels via CONNECT with proxy auth" {
 
     var mock = try Mock.start(alloc);
     try mock.spawn(mockProxyTunnelMain);
+    defer mock.join(); // after bridge.deinit (LIFO); the mock returns once
+    // the ClientHello lands, so join never blocks
 
     var collector = Collector{ .alloc = alloc };
     defer collector.deinit();
@@ -476,6 +479,7 @@ test "proxy: https target tunnels via CONNECT with proxy auth" {
 
     var cfg = Config{ .target = target, .url = "https://origin.example/mcp", .transport = .http_only };
     var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
+    defer bridge.deinit(); // teardown even when an expect fails
 
     bridge.injectLine("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
     // The ClientHello (through the tunnel) lands in the mock.
@@ -488,9 +492,6 @@ test "proxy: https target tunnels via CONNECT with proxy auth" {
     while (!helloCond(&mock) and rounds < 500) : (rounds += 1) bridge.step(10) catch break;
     try std.testing.expect(mock.extra > 0);
     try std.testing.expect(mock.answer_seen); // CONNECT line + auth header
-
-    bridge.deinit();
-    mock.join();
 }
 
 /// Proxy mock for a PLAIN http target: the request line must be

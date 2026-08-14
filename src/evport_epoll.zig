@@ -4,11 +4,16 @@
 //   - Sockets: read interest is persistent edge-triggered (EPOLLIN |
 //     EPOLLET | EPOLLRDHUP; handlers fully drain — the EV_CLEAR
 //     equivalent). EPOLLRDHUP gives half-close as an event.
-//   - Write interest is on-demand level-triggered EPOLLOUT: armed by
-//     wantWrite, disarmed by cancelWrite when the queue drains. (EPOLLOUT
-//     stays quiet while the send buffer is full, so no spin; ONESHOT is
-//     unusable here because it disarms the fd's WHOLE registration,
-//     including the persistent read side.)
+//   - Write interest is on-demand "level-triggered" EPOLLOUT: armed by
+//     wantWrite, disarmed by cancelWrite when the queue drains. NOTE:
+//     EPOLLET in the shared mask applies to the fd's WHOLE registration,
+//     so with read interest armed (always, for conns) EPOLLOUT is
+//     effectively EDGE-triggered: a still-writable socket produces no
+//     second writable event after connect. Conn write paths must attempt
+//     the write FIRST and wait only after an actual want_write (EAGAIN) —
+//     see driveWrite / driveProxyTunnel. (EPOLLONESHOT is unusable here
+//     because it disarms the fd's WHOLE registration, including the
+//     persistent read side.)
 //   - Registrations apply immediately (epoll_ctl has no batching); the
 //     kqueue-side "staged changelist" rule is kqueue-specific.
 //   - Cross-thread wakeup: eventfd (the pipe trick's Linux twin).

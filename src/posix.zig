@@ -164,7 +164,13 @@ test "PlainNb: connect refused surfaces at connectDone" {
     const port = server.listen_address.getPort();
     server.deinit();
 
-    var client = try PlainNb.startConnect(alloc, "127.0.0.1", port);
+    // Loopback refusal is timing-dependent: connect() may report
+    // ECONNREFUSED synchronously (startConnect fails) instead of
+    // EINPROGRESS-then-SO_ERROR. Both report ConnectFailed; accept either.
+    var client = PlainNb.startConnect(alloc, "127.0.0.1", port) catch |err| {
+        try std.testing.expectEqual(PlainNb.Error.ConnectFailed, err);
+        return;
+    };
     defer client.deinit();
 
     var evp = try evport.EvPort.init(alloc);
