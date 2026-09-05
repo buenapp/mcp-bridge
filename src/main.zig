@@ -2100,6 +2100,18 @@ pub fn main() !void {
     var file_sc: ?config_file.ServerConfig = null;
     if (cf) |*c| file_sc = c.lookup(cfg.url);
 
+    // Config-file headers join the CLI --header set; on a name collision
+    // the CLI entry wins (flags override file values). File header lines
+    // are arena-backed and live until cf deinit at return, same lifetime
+    // as the argv slices.
+    if (file_sc) |sc| {
+        if (sc.headers.len > 0) {
+            const merged = try config_file.mergeHeaders(alloc, cfg.headers.items, sc.headers);
+            cfg.headers.clearRetainingCapacity();
+            try cfg.headers.appendSlice(alloc, merged);
+        }
+    }
+
     const resource: ?[]const u8 = oauth_resource orelse if (file_sc) |sc| sc.resource else null;
 
     // --debug: full diagnostics (both classes, regardless of --verbose and

@@ -273,11 +273,26 @@ flags override file values:
       "scope": "openid profile",
       "resource": "https://tenant1.example.net/",
       "grant": "authorization_code",
-      "transport": "sse-only"
+      "transport": "sse-only",
+      "headers": {
+        "Authorization": "Bearer <token>",
+        "X-Custom": "value"
+      }
     }
   }
 }
 ```
+
+**Static headers.** The `headers` object accepts `"Name": "Value"` pairs
+sent on every request to that server — the config-file equivalent of
+`--header`, merged with it (a `--header` entry for the same header name
+wins, case-insensitively). Prefer the config file for long-lived tokens:
+`--header` values appear in the bridge's command line and are visible in
+the process list, while this file can be locked down with normal file
+permissions. Malformed entries (non-object `headers`, non-string values,
+names that are not valid HTTP field names, or values containing CR/LF)
+fail config loading with a logged error rather than silently dropping
+the header.
 
 ## Protocol behavior
 
