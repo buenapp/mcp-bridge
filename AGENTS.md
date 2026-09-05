@@ -1,17 +1,20 @@
 # mcp-bridge agent notes
 
 ## Toolchain (PINNED)
-- Build with `zig0152` (Zig 0.15.2, /opt/zig-x86_64-freebsd-0.15.2). The
-  system `zig` is 0.16.0 (upgraded 2026-08-10) whose std APIs are
-  incompatible (std.fs → std.Io with Io instances, std.posix socket fns
-  removed, std.heap.DebugAllocator rename, etc.). Do NOT "fix" the sources
-  for 0.16 — the deliberate 0.16 port is a separate tracked effort.
-  - Tests: `zig0152 build test`
-  - Release builds: `zig0152 build -Dtarget=x86_64-{freebsd,windows-gnu,linux-gnu} -Doptimize=ReleaseSafe`
+- Build with Zig 0.15.2. On freebsd-dev1 it is the `zig015-0.15.2` pkg,
+  installed as `/usr/local/bin/zig` (verify: `zig version` → 0.15.2). The
+  `zig0152`/`zig016` symlinks into `/opt/zig-x86_64-freebsd-*` dangle —
+  that /opt layout does not exist on this host.
+- Zig 0.16.0 std APIs are incompatible with these sources (std.fs →
+  std.Io with Io instances, std.posix socket fns removed,
+  std.heap.DebugAllocator rename, etc.). Do NOT "fix" the sources for 0.16
+  — the deliberate 0.16 port is a separate tracked effort.
+  - Tests: `zig build test`
+  - Release builds: `zig build -Dtarget=x86_64-{freebsd,windows-gnu,linux-gnu} -Doptimize=ReleaseSafe`
 - Linux test binary cross-build (for the VMs): see git log / Heliofane
   McpBridge notes.
 - Multi-process live test for the OAuth lockfile coordination (issue #3):
-  build the native binary first (`zig0152 build -Dtarget=x86_64-freebsd`),
+  build the native binary first (`zig build -Dtarget=x86_64-freebsd`),
   then `python3 tests/live_oauth_lock.py` (needs openssl + curl; spins a
   local HTTPS mock AS with a throwaway CA via SSL_CERT_FILE and races two
   bridge processes on a shared token cache).
