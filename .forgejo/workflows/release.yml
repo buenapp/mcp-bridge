@@ -224,7 +224,7 @@ jobs:
 
           # Create release
           RESP=$(curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
-            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"## MCP Bridge $TAG\\n\\nCommit: $GITHUB_SHA\\n\\n### Downloads\\n- **mcp-bridge-${VERSION}-setup.exe** — Windows installer (per-user, no admin)\\n- **mcp-bridge-${VERSION}.exe** — standalone Windows binary\\n- **mcp-bridge-${VERSION}-x86_64-freebsd** — FreeBSD binary (base OpenSSL, certctl trust)\\n- **mcp-bridge-${VERSION}-x86_64-linux** — Linux binary (glibc, distro OpenSSL 3)\\n\\nWindows assets are Authenticode-signed.\",\"draft\":false,\"prerelease\":$PRERELEASE}" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"## MCP Bridge $TAG\\n\\nCommit: $GITHUB_SHA\\n\\n### Downloads\\n- **mcp-bridge-${VERSION}-setup.exe** — Windows installer (system-wide or current-user, your choice)\\n- **mcp-bridge-${VERSION}.exe** — standalone Windows binary\\n- **mcp-bridge-${VERSION}-x86_64-freebsd** — FreeBSD binary (base OpenSSL, certctl trust)\\n- **mcp-bridge-${VERSION}-x86_64-linux** — Linux binary (glibc, distro OpenSSL 3)\\n\\nWindows assets are Authenticode-signed.\",\"draft\":false,\"prerelease\":$PRERELEASE}" \
             "$BASE_URL/releases")
           echo "Create release response: $RESP"
           RELEASE_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')

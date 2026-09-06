@@ -31,11 +31,13 @@ Pre-built binaries and packages are on the
 
 Download and run the installer:
 
-- `mcp-bridge-<ver>-setup.exe` — per-user installer (no admin required,
-  Authenticode-signed). Installs `mcp-bridge.exe` into
-  `%LOCALAPPDATA%\Programs\MCP Bridge` and adds that directory to the user
-  `PATH`. **Restart your MCP client** after installing so it picks up the
-  new `PATH`.
+- `mcp-bridge-<ver>-setup.exe` — Authenticode-signed installer. The
+  install-mode choice defaults to **system-wide** (`%PROGRAMFILES%\MCP
+  Bridge`, machine `PATH`) when run with administrator rights; without
+  admin rights it installs for the **current user**
+  (`%LOCALAPPDATA%\Programs\MCP Bridge`, user `PATH`). Upgrading from a
+  pre-0.1.3 build removes the old per-user install. **Restart your MCP
+  client** after installing so it picks up the new `PATH`.
 - `mcp-bridge-<ver>.exe` — standalone binary (also signed) if you prefer
   to place it somewhere yourself.
 
