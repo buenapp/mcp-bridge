@@ -100,7 +100,7 @@ pub const PlainNb = struct {
 // --------------------------------------------------------------- tests ----
 
 test "PlainNb: non-blocking connect + round trip over loopback" {
-    const evport = @import("evport.zig");
+    const evport = @import("born");
     const alloc = std.testing.allocator;
 
     const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
@@ -155,7 +155,7 @@ test "PlainNb: non-blocking connect + round trip over loopback" {
 }
 
 test "PlainNb: connect refused surfaces at connectDone" {
-    const evport = @import("evport.zig");
+    const evport = @import("born");
     const alloc = std.testing.allocator;
 
     // Bind+close to find a free port nothing listens on.

@@ -5,7 +5,7 @@
 // never analyzed on the non-matching target, so POSIX files don't exist as
 // far as the Windows build is concerned (and vice versa).
 //
-// The event-driven core uses evport.zig (kqueue/epoll/IOCP) and the
+// The event-driven core uses the born event port (kqueue/epoll/IOCP) and the
 // non-blocking stream layer (nb_posix.zig / nb_win.zig); what remains
 // here is the certificate Verifier.
 
