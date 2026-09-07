@@ -190,6 +190,10 @@ pub const Bridge = struct {
     // ---- stdout write queue (production; tests use a memory sink) ----
     stdout_q: std.ArrayList(u8) = .empty,
     stdout_is_fd: bool = false,
+    /// Windows only: stdout is a disk file or console (not an IDE pipe) —
+    /// queueStdout writes it directly with blocking WriteFile instead of
+    /// silently discarding output like a bare `> log.txt` would hit.
+    stdout_direct: bool = false,
     stdout_dead: bool = false, // EPIPE: the IDE is gone; drop queued output
 
     // ---- Windows stdio relay (libuv pattern for non-overlappable IDE
@@ -316,13 +320,20 @@ pub const Bridge = struct {
     fn attachStdioWin(self: *Bridge) void {
         const win = @import("win.zig");
         const stdout_h = win.GetStdHandle(win.STD_OUTPUT_HANDLE);
-        if (stdout_h != null and win.GetFileType(stdout_h.?) == win.FILE_TYPE_PIPE) {
-            // Stdout writer relay: event-signaled queue drained by blocking
-            // WriteFile off the loop thread.
-            self.stdout_relay.event = win.CreateEventExW(null, null, 0, 0x1F0003); // EVENT_ALL_ACCESS
-            if (self.stdout_relay.event != null) {
-                self.stdout_relay.thread = std.Thread.spawn(.{}, stdoutWriterMain, .{self}) catch null;
-                self.stdout_is_fd = self.stdout_relay.thread != null;
+        if (stdout_h != null) {
+            if (win.GetFileType(stdout_h.?) == win.FILE_TYPE_PIPE) {
+                // Stdout writer relay: event-signaled queue drained by blocking
+                // WriteFile off the loop thread.
+                self.stdout_relay.event = win.CreateEventExW(null, null, 0, 0x1F0003); // EVENT_ALL_ACCESS
+                if (self.stdout_relay.event != null) {
+                    self.stdout_relay.thread = std.Thread.spawn(.{}, stdoutWriterMain, .{self}) catch null;
+                    self.stdout_is_fd = self.stdout_relay.thread != null;
+                }
+            } else {
+                // Not an IDE pipe (console window / `> file`): direct blocking
+                // writes — these sinks complete synchronously, no queue needed.
+                self.stdout_direct = true;
+                self.stdout_is_fd = true;
             }
         }
         const stdin_h = win.GetStdHandle(win.STD_INPUT_HANDLE);
@@ -417,6 +428,19 @@ pub const Bridge = struct {
     fn queueStdout(self: *Bridge, bytes: []const u8) void {
         if (!self.stdout_is_fd) return;
         if (platform.is_windows) {
+            const win = @import("win.zig");
+            if (self.stdout_direct) {
+                // Console/disk stdout: blocking WriteFile completes
+                // synchronously for these sink types; no relay thread.
+                const h = win.GetStdHandle(win.STD_OUTPUT_HANDLE) orelse return;
+                var off: usize = 0;
+                while (off < bytes.len) {
+                    var n: u32 = 0;
+                    if (win.WriteFile(h, bytes.ptr + off, @intCast(bytes.len - off), &n, null) == 0) return;
+                    off += n;
+                }
+                return;
+            }
             const r = &self.stdout_relay;
             r.mutex.lock();
             if (!r.dead) r.queue.appendSlice(self.alloc, bytes) catch {};
