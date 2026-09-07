@@ -129,7 +129,7 @@ pub const Config = struct {
 
 fn usage() noreturn {
     std.debug.print(
-        \\usage: mcp-bridge.exe <url> [options]
+        \\usage: mcp-bridge <url> [options]
         \\
         \\  url                     http(s)://host[:port]/path of the MCP server
         \\  --header "Name: Value"  extra request header (repeatable)
