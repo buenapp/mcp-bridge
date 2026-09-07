@@ -9,6 +9,11 @@ const std = @import("std");
 /// Prefers the unversioned dev symlink, falls back to the versioned
 /// runtime object (always present, no -dev package needed for linking),
 /// and finally to plain -l (cross/sysroot cases).
+const zon = @import("build.zig.zon");
+
+/// Reported by --version; build.zig.zon .version tracks the release tag.
+const version = zon.version;
+
 fn linkDistroLib(b: *std.Build, mod: *std.Build.Module, name: []const u8, soname: []const u8) void {
     const dirs = [_][]const u8{
         "/usr/lib/x86_64-linux-gnu", // Debian/Ubuntu
@@ -69,6 +74,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("born", born.module("born"));
+
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "version", version);
+    exe.root_module.addOptions("build_options", opts);
 
     if (target.result.os.tag == .windows) {
         // Icon + version info (Windows resource script, compiled by zig's rc)

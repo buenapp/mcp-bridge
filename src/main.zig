@@ -41,6 +41,7 @@ const proxy = @import("proxy.zig");
 const config_file = @import("config.zig");
 const evport = @import("born");
 const httpc = @import("httpc.zig");
+const build_options = @import("build_options");
 
 const log = std.log.scoped(.bridge);
 
@@ -142,6 +143,7 @@ fn usage() noreturn {
         \\  --auth-timeout SECS     OAuth browser-flow callback timeout (default 180)
         \\  --enable-proxy          honor http_proxy/https_proxy/no_proxy env vars
         \\                          (CONNECT tunnel for https, absolute-form for http)
+        \\  --version               print version and exit
         \\
         \\OAuth 2.1 (auto-activates on a 401 even without flags):
         \\  --oauth                 enable OAuth for this server
@@ -1982,7 +1984,10 @@ pub fn main() !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
+        if (std.mem.eql(u8, a, "--version")) {
+            std.fs.File.stdout().writeAll("mcp-bridge " ++ build_options.version ++ "\n") catch {};
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
             cfg.verbose = true;
         } else if (std.mem.eql(u8, a, "--silent")) {
             cfg.silent = true;
