@@ -56,6 +56,10 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
+    // The event port lives in born now; see docs in that repo for the
+    // read-persistent/write-oneshot contract these call sites rely on.
+    const born = b.dependency("born", .{ .target = target, .optimize = optimize });
+
     const exe = b.addExecutable(.{
         .name = "mcp-bridge",
         .root_module = b.createModule(.{
@@ -64,6 +68,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addImport("born", born.module("born"));
 
     if (target.result.os.tag == .windows) {
         // Icon + version info (Windows resource script, compiled by zig's rc)
@@ -126,6 +131,8 @@ pub fn build(b: *std.Build) void {
     // Host-side unit tests (dane matcher, mcp, pkce, oauth, config).
     // oauth.zig reaches the platform TLS layer, so the host test binary
     // needs the same link setup as the executable.
+    const born_host = b.dependency("born", .{ .target = b.graph.host, .optimize = optimize });
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_main.zig"),
@@ -133,6 +140,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    tests.root_module.addImport("born", born_host.module("born"));
     if (b.graph.host.result.os.tag == .windows) {
         tests.root_module.linkSystemLibrary("ws2_32", .{});
         tests.root_module.linkSystemLibrary("secur32", .{});

@@ -39,7 +39,7 @@ const oauth_lock = @import("oauth_lock.zig");
 const ulog = @import("ulog.zig");
 const proxy = @import("proxy.zig");
 const config_file = @import("config.zig");
-const evport = @import("evport.zig");
+const evport = @import("born");
 const httpc = @import("httpc.zig");
 
 const log = std.log.scoped(.bridge);

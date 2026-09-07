@@ -8,7 +8,7 @@ const pkce = @import("pkce.zig");
 const oauth = @import("oauth.zig");
 const config = @import("config.zig");
 const sse = @import("sse.zig");
-const evport = @import("evport.zig");
+const evport = @import("born");
 const ulog = @import("ulog.zig");
 const test_transport = @import("test_transport.zig");
 
@@ -21,8 +21,7 @@ comptime {
     _ = test_transport;
     // Backend tests live in the per-platform files; reference the ones for
     // this host so their tests are discovered.
-    if (builtin.os.tag == .freebsd) _ = @import("evport_kqueue.zig");
-    if (builtin.os.tag == .linux) _ = @import("evport_epoll.zig");
+    // Event port tests live in born and run in that repo's own suite.
     if (builtin.os.tag != .windows) {
         _ = @import("posix.zig");
         _ = @import("tls_openssl.zig");
