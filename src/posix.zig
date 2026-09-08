@@ -4,98 +4,13 @@
 // timeout plumbing retired with the serial core.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const socket = @import("born").socket;
 
 // ------------------------------------------------------- non-blocking ----
 
-/// MSG_NOSIGNAL per target (std.os.freebsd exposes no MSG constants).
-/// send()-only flag: writes to a torn-down socket return EPIPE instead of
-/// raising SIGPIPE.
-const MSG_NOSIGNAL: u32 = switch (builtin.os.tag) {
-    .freebsd => 0x00020000,
-    .linux => 0x00004000,
-    else => 0,
-};
-
-/// Non-blocking read outcome.
-pub const NbRead = union(enum) {
-    data: usize, // > 0 bytes
-    want_read, // drained to EAGAIN; wait for the next read event
-    want_write, // TLS-only (post-handshake control messages); never for plain
-    eof, // clean close
-};
-
-/// Non-blocking write outcome.
-pub const NbWrite = union(enum) {
-    done: usize, // bytes accepted (may be a partial write)
-    want_read, // TLS-only; never for plain
-    want_write, // send buffer full; wait for the write event
-};
-
-/// Non-blocking plaintext TCP stream for the event core.
-pub const PlainNb = struct {
-    sock: std.posix.fd_t = -1,
-
-    pub const Error = error{
-        ConnectFailed,
-        SocketError,
-    };
-
-    /// socket(SOCK_NONBLOCK) + connect(). On success the fd is either in
-    /// EINPROGRESS state or instantly connected (loopback) — register write
-    /// interest and confirm with connectDone() on the first write event.
-    pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) Error!PlainNb {
-        const addr_list = std.net.getAddressList(alloc, host, port) catch return Error.ConnectFailed;
-        defer addr_list.deinit();
-        if (addr_list.addrs.len == 0) return Error.ConnectFailed;
-
-        for (addr_list.addrs) |addr| {
-            const s = std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0) catch continue;
-            std.posix.connect(s, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-                error.WouldBlock => return .{ .sock = s }, // EINPROGRESS
-                else => {
-                    std.posix.close(s);
-                    continue;
-                },
-            };
-            return .{ .sock = s }; // connected immediately
-        }
-        return Error.ConnectFailed;
-    }
-
-    /// Confirm the connect after the first write event (SO_ERROR).
-    pub fn connectDone(self: *PlainNb) Error!void {
-        var so_error: c_int = 0;
-        std.posix.getsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&so_error)) catch return Error.SocketError;
-        if (so_error != 0) return Error.ConnectFailed;
-    }
-
-    pub fn readNb(self: *PlainNb, out: []u8) Error!NbRead {
-        const n = std.posix.read(self.sock, out) catch |err| switch (err) {
-            error.WouldBlock => return .want_read,
-            else => return Error.SocketError,
-        };
-        if (n == 0) return .eof;
-        return .{ .data = n };
-    }
-
-    pub fn writeNb(self: *PlainNb, data: []const u8) Error!NbWrite {
-        const n = std.posix.send(self.sock, data, MSG_NOSIGNAL) catch |err| switch (err) {
-            error.WouldBlock => return .want_write,
-            else => return Error.SocketError,
-        };
-        return .{ .done = n };
-    }
-
-    pub fn closeNotify(self: *PlainNb) void {
-        _ = self;
-    }
-
-    pub fn deinit(self: *PlainNb) void {
-        if (self.sock >= 0) std.posix.close(self.sock);
-        self.sock = -1;
-    }
-};
+pub const NbRead = socket.NbRead;
+pub const NbWrite = socket.NbWrite;
+pub const PlainNb = socket.PlainNb;
 
 // --------------------------------------------------------------- tests ----
 

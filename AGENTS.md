@@ -18,11 +18,21 @@
   then `python3 tests/live_oauth_lock.py` (needs openssl + curl; spins a
   local HTTPS mock AS with a throwaway CA via SSL_CERT_FILE and races two
   bridge processes on a shared token cache).
+- Local born integration regression: after the native build run
+  `python3 tests/live_born.py --timeout 60` (optional first argument: binary).
+  It uses only standard Python, ephemeral local sockets and subprocess pipes:
+  53 assertions covering JSON, fragmented/chunked SSE, UTF-8 and typed IDs,
+  concurrent responses, 4 MiB backpressure, refusal/truncated peers,
+  bounded retries, GET resume and session deletion.
 
 ## Architecture (post issue #7 rework; event port lives in born since PR #9)
-- Single event loop over born (`@import("born")`, pinned 0.1.0 in
-  build.zig.zon; kqueue FreeBSD / epoll Linux / IOCP Windows). No I/O
-  threads, no timers/select/poll.
+- Single event loop over born (`@import("born")`, pinned in
+  build.zig.zon; kqueue FreeBSD / epoll Linux / IOCP Windows). No socket
+  I/O threads, no timers/select/poll; inherited Windows stdio uses the
+  relay threads described below.
+- Plain TCP/overlapped socket ownership lives in `born.socket.PlainNb`.
+  src/posix.zig and src/nb_win.zig alias its types; TLS, DANE, and logging
+  remain in mcp-bridge.
 - src/httpc.zig = event-driven HTTP conn state machine; src/nb_posix.zig
   (+ nb_win.zig) = non-blocking stream union; src/syncreq.zig = OAuth
   one-shots on a private event port.
@@ -44,3 +54,13 @@
   are true overlapped IOCP.
 - win11-dev (192.168.1.195) via vnc MCP: vnc_run_command works; serve
   files over HTTP from 192.168.1.233 (the MCP server's fs view differs).
+- Born associates Windows sockets during `startConnectInto`; do not repeat
+  IOCP association in the HTTP layer. POSIX still registers read interest.
+- Schannel must retain its native context across incomplete TLS records,
+  flush final handshake tokens, and acknowledge plaintext only after the
+  entire encrypted record completes. Partial writes must post the remainder,
+  not wait without an outstanding operation.
+- Focused Windows regressions (with sibling Born checkout):
+  `zig test -target x86_64-windows-gnu -O ReleaseSafe --dep born -Mroot=src/schannel.zig -target x86_64-windows-gnu -O ReleaseSafe -Mborn=../Born/src/root.zig -lws2_32 -lsecur32 -lcrypt32 -ldnsapi -lkernel32 -lshell32 --test-no-exec -femit-bin=/tmp/mcp-schannel-tests.exe`
+  Run the resulting executable on Windows; cross-compilation alone does not
+  verify the native Schannel context-fragmentation test.
