@@ -396,10 +396,12 @@ pub const Conn = struct {
 
         // Persistent edge-triggered read interest for the conn's whole
         // life; one-shot write interest for connect completion (the event
-        // port dedups write arms). On IOCP these are no-ops — the
+        // port dedups write arms). IOCP skips these registrations — the
         // association + in-flight connect happened inside startConnectInto.
-        evp.monitorRead(conn.stream.fd(), conn);
-        evp.wantWrite(conn.stream.fd(), conn);
+        if (!platform.is_windows) {
+            evp.monitorRead(conn.stream.fd(), conn);
+            evp.wantWrite(conn.stream.fd(), conn);
+        }
         return conn;
     }
 

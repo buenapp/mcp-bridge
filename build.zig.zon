@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .born = .{
-            .url = "https://pacyworld.dev/pacyworld/born/archive/v0.1.0.tar.gz",
-            .hash = "born-0.1.0-Yg13wHaeAAAKre-WadQDS28LK6-uGjSLlW-t8Vcxj2Z4",
+            .url = "https://pacyworld.dev/pacyworld/born/archive/v0.2.0.tar.gz",
+            .hash = "born-0.2.0-Yg13wId6AQAEbZ1E8FwmJLVX7gsDO_zqNbtz3vpki8UU",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md" },

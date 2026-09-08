@@ -936,7 +936,7 @@ pub const Bridge = struct {
         if (self.stdin_eof) return;
         self.stdin_eof = true;
         if (self.stdin_active) {
-            self.evp.unmonitorRead(std.posix.STDIN_FILENO);
+            if (!platform.is_windows) self.evp.unmonitorRead(std.posix.STDIN_FILENO);
             self.stdin_active = false;
         }
         if (self.stdin_carry.items.len > 0) {

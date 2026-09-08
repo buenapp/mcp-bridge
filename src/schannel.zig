@@ -48,6 +48,8 @@ pub const TlsNb = struct {
     // pending ciphertext out (handshake tokens and encrypted appdata)
     enc_out: std.ArrayList(u8) = .empty,
     enc_out_off: usize = 0,
+    enc_out_plaintext: usize = 0,
+    hs_complete: bool = false,
     hs_need_input: bool = false, // SChannel asked for more ciphertext
 
     /// Wrap an already-connected overlapped socket; acquire credentials.
@@ -88,18 +90,12 @@ pub const TlsNb = struct {
     pub fn handshakeDrive(self: *TlsNb) TlsError!nb.Drive {
         while (true) {
             // Flush pending handshake output tokens first.
-            if (self.enc_out_off < self.enc_out.items.len) {
-                switch (self.plain.writeNb(self.enc_out.items[self.enc_out_off..]) catch return TlsError.TlsError) {
-                    .done => |n| {
-                        self.enc_out_off += n;
-                        continue;
-                    },
-                    .want_write => return .want_write,
-                    .want_read => return .want_read, // unreachable for plain; tolerated
-                }
+            switch (try self.flushCiphertext()) {
+                .done => {},
+                .want_write => return .want_write,
+                .want_read => return .want_read, // unreachable for plain; tolerated
             }
-            self.enc_out.clearRetainingCapacity();
-            self.enc_out_off = 0;
+            if (self.hs_complete) return .done;
 
             // Pull more ciphertext when SChannel asked for it.
             if (self.hs_need_input) {
@@ -112,7 +108,7 @@ pub const TlsNb = struct {
                 }
             }
 
-            if (try self.handshakeStep()) return .done;
+            self.hs_complete = try self.handshakeStep();
         }
     }
 
@@ -131,7 +127,6 @@ pub const TlsNb = struct {
         var out_desc = win.SecBufferDesc{ .ulVersion = win.SECBUFFER_VERSION, .cBuffers = 1, .pBuffers = &out_buf };
 
         var attrs: win.DWORD = 0;
-        var new_ctx: win.CtxtHandle = .{};
         const status = win.InitializeSecurityContextW(
             &self.cred,
             if (self.have_ctx) &self.ctx else null,
@@ -141,13 +136,12 @@ pub const TlsNb = struct {
             win.SECURITY_NATIVE_DREP,
             if (self.have_ctx or self.hs_need_input) &in_desc else null,
             0,
-            &new_ctx,
+            &self.ctx,
             &out_desc,
             &attrs,
             null,
         );
-        self.ctx = new_ctx;
-        self.have_ctx = true;
+        if (win.SUCCEEDED(status)) self.have_ctx = true;
         vprint("mcp-bridge: [tls] ISC status 0x{x:0>8} (input {d} bytes buffered)\n", .{ @as(u32, @bitCast(status)), self.enc_buf.items.len });
 
         // Consume input: EXTRA marks the leftover suffix (pvBuffer may be
@@ -163,11 +157,11 @@ pub const TlsNb = struct {
 
         // Stage the output token (SChannel-allocated) into our own buffer.
         if (out_buf[0].pvBuffer != null) {
+            defer _ = win.FreeContextBuffer(out_buf[0].pvBuffer);
             const p: [*]u8 = @ptrCast(out_buf[0].pvBuffer.?);
             if (out_buf[0].cbBuffer > 0) {
                 self.enc_out.appendSlice(self.alloc, p[0..out_buf[0].cbBuffer]) catch return TlsError.OutOfMemory;
             }
-            _ = win.FreeContextBuffer(out_buf[0].pvBuffer);
         }
 
         if (status == win.SEC_E_OK) {
@@ -301,20 +295,45 @@ pub const TlsNb = struct {
 
     // ------------------------------------------------------------- write --
 
-    /// Write plaintext; encrypts one SChannel-framed chunk per call.
-    /// Plaintext is consumed once encrypted into our staging buffer — the
-    /// pending ciphertext flushes ahead of the next call.
-    pub fn writeNb(self: *TlsNb, data: []const u8) TlsError!nb.NbWrite {
-        // Flush pending ciphertext first.
-        if (self.enc_out_off < self.enc_out.items.len) {
-            switch (self.plain.writeNb(self.enc_out.items[self.enc_out_off..]) catch return TlsError.TlsError) {
-                .done => |n| self.enc_out_off += n,
+    fn flushCiphertext(self: *TlsNb) TlsError!nb.Drive {
+        while (self.enc_out_off < self.enc_out.items.len) {
+            const remaining = self.enc_out.items[self.enc_out_off..];
+            switch (self.plain.writeNb(remaining) catch return TlsError.TlsError) {
+                .done => |n| {
+                    if (n == 0 or n > remaining.len) return TlsError.TlsError;
+                    self.enc_out_off += n;
+                },
                 .want_write => return .want_write,
                 .want_read => return .want_read,
             }
-            if (self.enc_out_off < self.enc_out.items.len) return .want_write;
-            self.enc_out.clearRetainingCapacity();
-            self.enc_out_off = 0;
+        }
+        self.enc_out.clearRetainingCapacity();
+        self.enc_out_off = 0;
+        return .done;
+    }
+
+    fn finishWrite(self: *TlsNb) TlsError!nb.NbWrite {
+        switch (try self.flushCiphertext()) {
+            .done => {
+                const n = self.enc_out_plaintext;
+                self.enc_out_plaintext = 0;
+                return .{ .done = n };
+            },
+            .want_write => return .want_write,
+            .want_read => return .want_read,
+        }
+    }
+
+    /// Write plaintext; encrypts one SChannel-framed chunk per completed write.
+    /// Plaintext is consumed only after all staged ciphertext completes —
+    /// retries finish the pending record without encrypting it again.
+    pub fn writeNb(self: *TlsNb, data: []const u8) TlsError!nb.NbWrite {
+        // Flush pending ciphertext first.
+        if (self.enc_out_plaintext != 0) return self.finishWrite();
+        switch (try self.flushCiphertext()) {
+            .done => {},
+            .want_write => return .want_write,
+            .want_read => return .want_read,
         }
         if (data.len == 0) return .{ .done = 0 };
 
@@ -344,13 +363,9 @@ pub const TlsNb = struct {
         const total: usize = bufs[0].cbBuffer + bufs[1].cbBuffer + bufs[2].cbBuffer;
         self.enc_out.items.len = total;
 
-        // Flush once; any remainder stays pending for the next call.
-        switch (self.plain.writeNb(self.enc_out.items) catch return TlsError.TlsError) {
-            .done => |n| self.enc_out_off = n,
-            .want_write => {},
-            .want_read => {},
-        }
-        return .{ .done = chunk }; // plaintext consumed; cipher is ours
+        // Flush fully; retries retain the plaintext count for this record.
+        self.enc_out_plaintext = chunk;
+        return self.finishWrite(); // plaintext consumed only after cipher completes
     }
 
     /// Best-effort close_notify.
@@ -400,3 +415,158 @@ pub const TlsNb = struct {
         self.plain.deinit();
     }
 };
+
+test "Schannel native handshake preserves context across fragmented TLS record input" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tls = try TlsNb.initFromPlain(std.testing.allocator, .{}, "localhost");
+    defer tls.deinit();
+
+    try std.testing.expect(!tls.have_ctx);
+    try std.testing.expect(!try tls.handshakeStep());
+    try std.testing.expect(tls.have_ctx);
+    try std.testing.expect(tls.hs_need_input);
+    try std.testing.expect(tls.enc_out.items.len > 0);
+    const ctx = tls.ctx;
+    tls.enc_out.clearRetainingCapacity();
+    tls.enc_out_off = 0;
+
+    const prefix = [_]u8{ 0x16, 0x03, 0x03, 0x00, 0x40 };
+    for (prefix, 0..) |byte, i| {
+        try tls.enc_buf.append(tls.alloc, byte);
+        try std.testing.expect(!try tls.handshakeStep());
+        try std.testing.expect(tls.have_ctx);
+        try std.testing.expect(tls.hs_need_input);
+        try std.testing.expectEqual(ctx.dwLower, tls.ctx.dwLower);
+        try std.testing.expectEqual(ctx.dwUpper, tls.ctx.dwUpper);
+        try std.testing.expectEqualSlices(u8, prefix[0 .. i + 1], tls.enc_buf.items);
+        try std.testing.expectEqual(@as(usize, 0), tls.enc_out.items.len);
+    }
+}
+
+test "Schannel pending record acknowledges plaintext exactly once after completion" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tls = TlsNb{
+        .plain = .{ .sock = @ptrFromInt(1), .send_pending = true, .send_len = 128 },
+        .alloc = std.testing.allocator,
+        .enc_out_plaintext = 100,
+    };
+    defer tls.enc_out.deinit(tls.alloc);
+    try tls.enc_out.appendNTimes(tls.alloc, 0x5a, 128);
+    const plaintext = [_]u8{0x42} ** 100;
+
+    try std.testing.expectEqual(nb.NbWrite.want_write, try tls.writeNb(&plaintext));
+    try std.testing.expectEqual(nb.NbWrite.want_write, try tls.writeNb(&plaintext));
+    try std.testing.expectEqual(@as(usize, 100), tls.enc_out_plaintext);
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_off);
+    try std.testing.expectEqual(nb.CompletionKind.send, tls.plain.absorbCompletion(&tls.plain.send_ov, 128, null));
+    try std.testing.expectEqual(nb.NbWrite{ .done = 100 }, try tls.writeNb(&plaintext));
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_plaintext);
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_off);
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tls.plain.pendingOps());
+    try std.testing.expectEqual(nb.NbWrite{ .done = 0 }, try tls.writeNb(""));
+}
+
+test "Schannel record larger than Born send buffer retains plaintext through partial completion" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tls = TlsNb{
+        .plain = .{ .sock = @ptrFromInt(1), .send_pending = true },
+        .alloc = std.testing.allocator,
+    };
+    defer tls.enc_out.deinit(tls.alloc);
+    const chunk = tls.plain.send_buf.len;
+    const plaintext = try tls.alloc.alloc(u8, chunk);
+    defer tls.alloc.free(plaintext);
+    @memset(plaintext, 0x42);
+    tls.enc_out_plaintext = chunk;
+    try tls.enc_out.appendNTimes(tls.alloc, 0x5a, chunk + 64);
+    tls.plain.send_just_done = chunk;
+    tls.plain.send_len = 64;
+
+    try std.testing.expectEqual(nb.NbWrite.want_write, try tls.writeNb(plaintext));
+    try std.testing.expectEqual(chunk, tls.enc_out_off);
+    try std.testing.expectEqual(chunk, tls.enc_out_plaintext);
+    try std.testing.expectEqual(chunk + 64, tls.enc_out.items.len);
+    try std.testing.expectEqual(@as(usize, 1), tls.plain.pendingOps());
+    try std.testing.expectEqual(nb.CompletionKind.send, tls.plain.absorbCompletion(&tls.plain.send_ov, 64, null));
+    try std.testing.expectEqual(nb.NbWrite{ .done = chunk }, try tls.writeNb(plaintext));
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_off);
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_plaintext);
+
+    try tls.enc_out.appendNTimes(tls.alloc, 0x6b, 32);
+    tls.enc_out_plaintext = 16;
+    tls.plain.send_pending = true;
+    tls.plain.send_len = 32;
+    try std.testing.expectEqual(nb.NbWrite.want_write, try tls.writeNb("next record data"));
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_off);
+    try std.testing.expectEqual(nb.CompletionKind.send, tls.plain.absorbCompletion(&tls.plain.send_ov, 32, null));
+    try std.testing.expectEqual(nb.NbWrite{ .done = 16 }, try tls.writeNb("next record data"));
+    try std.testing.expectEqual(nb.NbWrite{ .done = 0 }, try tls.writeNb(""));
+}
+
+test "Schannel partial completion attempts remaining send instead of waiting without an operation" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tls = TlsNb{
+        .plain = .{ .sock = @ptrFromInt(1), .send_just_done = 16384 },
+        .alloc = std.testing.allocator,
+        .enc_out_plaintext = 16384,
+    };
+    defer tls.enc_out.deinit(tls.alloc);
+    try tls.enc_out.appendNTimes(tls.alloc, 0x5a, 16448);
+
+    try std.testing.expectError(TlsError.TlsError, tls.writeNb("retry"));
+    try std.testing.expectEqual(@as(usize, 16384), tls.enc_out_off);
+    try std.testing.expectEqual(@as(usize, 16384), tls.enc_out_plaintext);
+    try std.testing.expectEqual(@as(usize, 64), tls.plain.send_len);
+    try std.testing.expectEqualSlices(u8, tls.enc_out.items[16384..], tls.plain.send_buf[0..64]);
+    try std.testing.expectEqual(@as(usize, 0), tls.plain.pendingOps());
+}
+
+test "Schannel resets exhausted ciphertext offset before another write" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tls = TlsNb{ .plain = .{}, .alloc = std.testing.allocator, .enc_out_off = 128 };
+    defer tls.enc_out.deinit(tls.alloc);
+    try tls.enc_out.appendNTimes(tls.alloc, 0x5a, 128);
+
+    try std.testing.expectEqual(nb.NbWrite{ .done = 0 }, try tls.writeNb(""));
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_off);
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out.items.len);
+}
+
+test "Schannel completed handshake flushes final token before returning done" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tls = TlsNb{
+        .plain = .{ .sock = @ptrFromInt(1), .send_pending = true, .send_len = 128 },
+        .alloc = std.testing.allocator,
+        .hs_complete = true,
+        .hs_need_input = true,
+    };
+    defer tls.enc_out.deinit(tls.alloc);
+    try tls.enc_out.appendNTimes(tls.alloc, 0x5a, 128);
+
+    try std.testing.expectEqual(nb.Drive.want_write, try tls.handshakeDrive());
+    try std.testing.expectEqual(nb.Drive.want_write, try tls.handshakeDrive());
+    try std.testing.expect(!tls.plain.recv_pending);
+    try std.testing.expectEqual(nb.CompletionKind.send, tls.plain.absorbCompletion(&tls.plain.send_ov, 128, null));
+    try std.testing.expectEqual(nb.Drive.done, try tls.handshakeDrive());
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_off);
+    try std.testing.expectEqual(@as(usize, 0), tls.plain.pendingOps());
+    try std.testing.expectEqual(nb.Drive.done, try tls.handshakeDrive());
+}
+
+test "Schannel rejects zero-progress ciphertext completion" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tls = TlsNb{
+        .plain = .{ .sock = @ptrFromInt(1), .send_just_done = 0 },
+        .alloc = std.testing.allocator,
+        .enc_out_plaintext = 100,
+    };
+    defer tls.enc_out.deinit(tls.alloc);
+    try tls.enc_out.appendNTimes(tls.alloc, 0x5a, 128);
+
+    try std.testing.expectError(TlsError.TlsError, tls.writeNb("retry"));
+    try std.testing.expectEqual(@as(usize, 100), tls.enc_out_plaintext);
+    try std.testing.expectEqual(@as(usize, 0), tls.enc_out_off);
+}
