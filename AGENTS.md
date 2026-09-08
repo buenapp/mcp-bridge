@@ -19,12 +19,18 @@
   local HTTPS mock AS with a throwaway CA via SSL_CERT_FILE and races two
   bridge processes on a shared token cache).
 
-## Architecture (post issue #7 rework)
-- Single event loop over src/evport.zig (kqueue FreeBSD / epoll Linux /
-  IOCP Windows). No I/O threads, no timers/select/poll.
+## Architecture (post issue #7 rework; event port lives in born since PR #9)
+- Single event loop over born (`@import("born")`, pinned 0.1.0 in
+  build.zig.zon; kqueue FreeBSD / epoll Linux / IOCP Windows). No I/O
+  threads, no timers/select/poll.
 - src/httpc.zig = event-driven HTTP conn state machine; src/nb_posix.zig
   (+ nb_win.zig) = non-blocking stream union; src/syncreq.zig = OAuth
   one-shots on a private event port.
+- Remote stdio forward (issue #15, src/stdiofwd.zig + fwd* in main.zig):
+  stdio+tcp (POSIX only) and stdio+ssh (also Windows via child-pipe relay
+  threads). Gotchas learned live: never double-close the shared tcp fd
+  (rd_fd == wr_fd); disown child pipe Files (c.stdin/c.stdout = null)
+  before Child.kill() or cleanupStreams BADF-panics.
 - Conn lifecycle: close() marks; end-of-batch reap purges staged
   changelist entries then close(2) (kqueue) — never stage registrations
   for fds about to close.
