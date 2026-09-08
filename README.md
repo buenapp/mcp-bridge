@@ -162,6 +162,38 @@ it (HTTP 405) are tolerated silently.
 OAuth and DANE apply to both transports and to every connection they
 open.
 
+## Remote stdio targets (no HTTP)
+
+The target can also be a stdio MCP server on another machine (issue #15
+— for servers that exist only as stdio on a remote host, e.g. a
+platform-specific tool):
+
+```sh
+# Raw socket: a socat/nc listener execs the server per connection.
+# On the server host (POSIX):
+#   socat TCP-LISTEN:6600,reuseaddr,fork EXEC:/opt/bin/vnc-mcp-server
+mcp-bridge stdio+tcp://192.0.2.10:6600
+
+# SSH: the system ssh client runs the server remotely.
+mcp-bridge stdio+ssh://admin@freebsd-dev1/opt/bin/vnc-mcp-server
+# trailing positionals become remote arguments:
+mcp-bridge stdio+ssh://admin@host:2222/opt/bin/vnc-mcp-server --verbose
+```
+
+- `stdio+tcp://` — plain TCP, line-framed JSON-RPC both ways; POSIX
+  clients only in this build.
+- `stdio+ssh://` — spawns `ssh -T -o BatchMode=yes -o ConnectTimeout=10`
+  (POSIX and Windows; OpenSSH ships with Windows 10+). Auth comes from
+  your own `~/.ssh` config/keys/agent. The remote path must be absolute;
+  everything is shell-quoted, and ssh's own stderr (auth failures etc.)
+  is surfaced on the bridge's stderr.
+- `--ignore-tool` still filters `tools/list` both ways. HTTP-only flags
+  (`--header`, `--oauth*`, `--transport`, ...) are rejected in this mode —
+  there is no HTTP leg for them to act on.
+- Exit status is 0 when the IDE closed stdin (normal) and 1 when the
+  remote endpoint died mid-session (connect refused, server crash, ssh
+  failure).
+
 ## OAuth 2.1
 
 When a server answers **401 Unauthorized** (or `--oauth` / a config entry
