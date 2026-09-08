@@ -11,6 +11,7 @@ const sse = @import("sse.zig");
 const evport = @import("born");
 const ulog = @import("ulog.zig");
 const test_transport = @import("test_transport.zig");
+const stdiofwd = @import("stdiofwd.zig");
 
 comptime {
     _ = pkce;
@@ -19,6 +20,7 @@ comptime {
     _ = evport;
     _ = ulog;
     _ = test_transport;
+    _ = stdiofwd;
     // Backend tests live in the per-platform files; reference the ones for
     // this host so their tests are discovered.
     // Event port tests live in born and run in that repo's own suite.

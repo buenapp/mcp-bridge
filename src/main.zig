@@ -42,6 +42,7 @@ const config_file = @import("config.zig");
 const evport = @import("born");
 const httpc = @import("httpc.zig");
 const build_options = @import("build_options");
+const stdiofwd = @import("stdiofwd.zig");
 
 const log = std.log.scoped(.bridge);
 
@@ -158,6 +159,15 @@ fn usage() noreturn {
         \\  --config PATH           JSON config file (default: ~/.config/mcp-bridge/config.json)
         \\  --oauth-logout          delete cached tokens for <url> and exit
         \\
+        \\Remote stdio targets (no HTTP involved):
+        \\  stdio+tcp://HOST:PORT   forward to a raw-socket stdio server
+        \\                          (e.g. socat tcp-listen:PORT,fork exec:<server>; POSIX only)
+        \\  stdio+ssh://[USER@]HOST[:PORT]/abs/path [remote args...]
+        \\                          spawn <path> on HOST via the system ssh client
+        \\                          (stderr of ssh goes to our stderr); remote args are
+        \\                          appended to the remote command line
+        \\  forward mode accepts only --ignore-tool / --verbose / --silent / --debug
+        \\
     , .{});
     std.process.exit(2);
 }
@@ -169,6 +179,8 @@ fn parseUrl(url: []const u8) !Target {
 /// Event udata sentinels for the stdio fds (conns carry *httpc.Conn).
 var stdin_sentinel: u8 = 0;
 var stdout_sentinel: u8 = 0;
+/// stdio+tcp / stdio+ssh forward target event tag (issue #15).
+var remote_sentinel: u8 = 0;
 
 /// Owns the event port, all upstream connections, the session id, the
 /// pending-id registry, the stdio sources/sinks, and OAuth state.
@@ -231,6 +243,9 @@ pub const Bridge = struct {
     push_retried: bool = false, // one post-death restart allowed
     push_last_event_id: ?[]u8 = null,
     push_auth_retried: bool = false, // per-attempt 401 budget
+
+    // ---- remote stdio forward mode (issue #15: stdio+tcp/stdio+ssh) ----
+    fwd: ?FwdState = null,
 
     // ---- shutdown ----
     shutting_down: bool = false,
@@ -302,6 +317,28 @@ pub const Bridge = struct {
         quit: bool = false,
         dead: bool = false, // EPIPE: the IDE is gone
         thread: ?std.Thread = null,
+    };
+
+    /// Everything about a stdio+tcp / stdio+ssh upstream. Owns the remote
+    /// endpoint's fds/handles, its write queue, and the ssh child. The data
+    /// plane is plain lines: IDE stdin → remote, remote → stdout.
+    pub const FwdState = struct {
+        target: stdiofwd.Target,
+        // POSIX: same fd for both directions on tcp; child pipe pair on ssh.
+        rd_fd: i32 = -1,
+        wr_fd: i32 = -1,
+        connected: bool = false, // tcp: pending EINPROGRESS confirm
+        write_q: std.ArrayList(u8) = .empty,
+        carry: std.ArrayList(u8) = .empty, // remote→client line assembly
+        child: ?*std.process.Child = null, // ssh (both OSes)
+        remote_eof: bool = false,
+        /// Set when the remote end died while the IDE session was live:
+        /// surfaced as the bridge's exit status.
+        exit_status: u8 = 0,
+        // Windows: ssh child pipes are anonymous (no overlapped I/O), so
+        // they get the same reader/writer relay treatment as IDE stdio.
+        relay_in: StdinRelay = .{}, // child stdout → loop mailbox
+        relay_out: StdoutRelay = .{}, // loop → child stdin queue
     };
 
     /// Production: wire up stdin + stdout for the loop.
@@ -418,6 +455,346 @@ pub const Bridge = struct {
             th.join();
         }
         // stdin reader: left blocked in ReadFile; ExitProcess reaps it.
+    }
+
+    // ------------------------------------------------- forward mode ----
+    // stdio+tcp / stdio+ssh (issue #15): the upstream is a line-framed
+    // stdio MCP server behind a raw socket or an ssh child. The HTTP
+    // machinery (conns, sessions, OAuth) is entirely bypassed.
+
+    /// Start the remote side: tcp connect or ssh child spawn, then
+    /// register with the event port. Call after attachStdio().
+    fn fwdStart(self: *Bridge) !void {
+        const f = &self.fwd.?;
+        switch (f.target) {
+            .tcp => |t| try self.fwdStartTcp(t),
+            .ssh => |*s| try self.fwdStartSsh(s),
+        }
+    }
+
+    fn fwdStartTcp(self: *Bridge, t: anytype) !void {
+        if (platform.is_windows) unreachable; // v1: rejected at parse
+        const f = &self.fwd.?;
+        ulog.vprint("mcp-bridge: forward stdio+tcp://{s}:{d}\n", .{ t.host, t.port });
+        const addr_list = try std.net.getAddressList(self.alloc, t.host, t.port);
+        defer addr_list.deinit();
+        if (addr_list.addrs.len == 0) return error.ConnectFailed;
+        var last_err: anyerror = error.ConnectFailed;
+        for (addr_list.addrs) |addr| {
+            const s = std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0) catch continue;
+            std.posix.connect(s, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+                error.WouldBlock => { // EINPROGRESS: confirm on first writable event
+                    f.rd_fd = s;
+                    f.wr_fd = s;
+                    f.connected = false;
+                    self.evp.wantWrite(s, @as(?*anyopaque, &remote_sentinel));
+                    return;
+                },
+                else => |e| {
+                    std.posix.close(s);
+                    last_err = e;
+                    continue;
+                },
+            };
+            // Connected immediately (loopback): arm read interest at once.
+            f.rd_fd = s;
+            f.wr_fd = s;
+            f.connected = true;
+            self.evp.monitorRead(s, @as(?*anyopaque, &remote_sentinel));
+            return;
+        }
+        return last_err;
+    }
+
+    fn fwdStartSsh(self: *Bridge, s: *const stdiofwd.Ssh) !void {
+        const f = &self.fwd.?;
+        const argv = try s.sshArgv(self.alloc);
+        ulog.vprint("mcp-bridge: forward ssh spawn: ssh ... {s}\n", .{argv[argv.len - 1]});
+        const child = try self.alloc.create(std.process.Child);
+        child.* = std.process.Child.init(argv, self.alloc);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Inherit; // ssh's diagnostics reach the IDE log
+        try child.spawn();
+        f.child = child;
+        if (platform.is_windows) {
+            // Anonymous pipes: reader/writer relay threads (same pattern as
+            // the IDE stdio relays above).
+            f.relay_in.thread = std.Thread.spawn(.{}, fwdReaderMain, .{self}) catch return error.SpawnFailed;
+            const win = @import("win.zig");
+            f.relay_out.event = win.CreateEventExW(null, null, 0, 0x1F0003) orelse return error.SpawnFailed;
+            f.relay_out.thread = std.Thread.spawn(.{}, fwdWriterMain, .{self}) catch return error.SpawnFailed;
+        } else {
+            const rfd = child.stdout.?.handle;
+            const wfd = child.stdin.?.handle;
+            setNonBlocking(rfd);
+            setNonBlocking(wfd);
+            f.rd_fd = rfd;
+            f.wr_fd = wfd;
+            f.connected = true;
+            self.evp.monitorRead(rfd, @as(?*anyopaque, &remote_sentinel));
+        }
+    }
+
+    /// Event-port wake for the remote endpoint (POSIX read/write events;
+    /// Windows: relay mailbox arrival).
+    fn onFwdEvent(self: *Bridge, ev: evport.Event) void {
+        if (platform.is_windows) {
+            self.onFwdEventWin();
+            return;
+        }
+        const f = &self.fwd.?;
+        if (!f.connected) {
+            if (!ev.writable) return;
+            // EINPROGRESS connect resolution.
+            var so_error: c_int = 0;
+            std.posix.getsockopt(f.rd_fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&so_error)) catch {
+                self.fwdRemoteClosed("connect failed");
+                return;
+            };
+            if (so_error != 0) {
+                self.fwdRemoteClosed("connect failed");
+                return;
+            }
+            f.connected = true;
+            self.evp.monitorRead(f.rd_fd, @as(?*anyopaque, &remote_sentinel));
+            self.fwdDrainWrites();
+        }
+        if (ev.readable or ev.eof) self.fwdReadRemote();
+        if (f.remote_eof) return;
+        if (ev.writable) self.fwdDrainWrites();
+    }
+
+    /// One IDE line → remote endpoint. Ignore-tool rejection already ran.
+    fn fwdClientLine(self: *Bridge, line: []const u8) void {
+        const f = &self.fwd.?;
+        if (f.remote_eof or self.shutting_down) return;
+        if (platform.is_windows) {
+            const r = &f.relay_out;
+            r.mutex.lock();
+            if (!r.dead) {
+                r.queue.appendSlice(self.alloc, line) catch {};
+                r.queue.append(self.alloc, '\n') catch {};
+            }
+            r.mutex.unlock();
+            if (r.event) |e| _ = @import("win.zig").SetEvent(e);
+            return;
+        }
+        f.write_q.appendSlice(self.alloc, line) catch {};
+        f.write_q.append(self.alloc, '\n') catch {};
+        if (f.connected) self.fwdDrainWrites();
+    }
+
+    /// POSIX: push the pending queue down the remote write fd.
+    fn fwdDrainWrites(self: *Bridge) void {
+        if (platform.is_windows) unreachable;
+        const f = &self.fwd.?;
+        const MSG_NOSIGNAL: u32 = switch (@import("builtin").os.tag) {
+            .freebsd => 0x00020000,
+            .linux => 0x00004000,
+            else => 0,
+        };
+        while (f.write_q.items.len > 0) {
+            const n = if (f.rd_fd == f.wr_fd) // tcp socket vs. ssh pipe?
+                std.posix.send(f.wr_fd, f.write_q.items, MSG_NOSIGNAL) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        self.evp.wantWrite(f.wr_fd, @as(?*anyopaque, &remote_sentinel));
+                        return;
+                    },
+                    else => {
+                        self.fwdRemoteClosed("remote write failed");
+                        return;
+                    },
+                }
+            else
+                std.posix.write(f.wr_fd, f.write_q.items) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        self.evp.wantWrite(f.wr_fd, @as(?*anyopaque, &remote_sentinel));
+                        return;
+                    },
+                    else => {
+                        self.fwdRemoteClosed("remote write failed");
+                        return;
+                    },
+                };
+            const rest = f.write_q.items.len - n;
+            std.mem.copyForwards(u8, f.write_q.items[0..rest], f.write_q.items[n..]);
+            f.write_q.items.len = rest;
+        }
+        self.evp.cancelWrite(f.wr_fd);
+    }
+
+    /// POSIX: remote readable — drain, split lines, deliver via the
+    /// --ignore-tool filter (writeServerPayload).
+    fn fwdReadRemote(self: *Bridge) void {
+        if (platform.is_windows) unreachable;
+        const f = &self.fwd.?;
+        var tmp: [16384]u8 = undefined;
+        while (true) {
+            const n = std.posix.read(f.rd_fd, &tmp) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => {
+                    self.fwdRemoteClosed("remote read failed");
+                    return;
+                },
+            };
+            if (n == 0) {
+                self.fwdRemoteClosed(null);
+                return;
+            }
+            f.carry.appendSlice(self.alloc, tmp[0..n]) catch {};
+            self.fwdSplitServerLines();
+            if (f.remote_eof) return; // a delivered line may have begun shutdown
+        }
+    }
+
+    fn fwdSplitServerLines(self: *Bridge) void {
+        const f = &self.fwd.?;
+        while (std.mem.indexOfScalar(u8, f.carry.items, '\n')) |nl| {
+            var line = f.carry.items[0..nl];
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            const owned = self.alloc.dupe(u8, line) catch null;
+            const rest = f.carry.items.len - (nl + 1);
+            std.mem.copyForwards(u8, f.carry.items[0..rest], f.carry.items[nl + 1 ..]);
+            f.carry.items.len = rest;
+            if (owned) |l| {
+                defer self.alloc.free(l);
+                if (l.len > 0) {
+                    ulog.vprint("mcp-bridge: << {s}\n", .{l});
+                    self.writeServerPayload(l);
+                }
+            }
+        }
+    }
+
+    /// Remote endpoint closed (server exit / ssh death / socket EOF),
+    /// expected or not. Flush any partial line, then shut the bridge down.
+    fn fwdRemoteClosed(self: *Bridge, why: ?[]const u8) void {
+        const f = &self.fwd.?;
+        if (f.remote_eof) return;
+        f.remote_eof = true;
+        if (f.carry.items.len > 0) {
+            var line = f.carry.items;
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            if (line.len > 0) self.writeServerPayload(line);
+            f.carry.clearRetainingCapacity();
+        }
+        if (!self.stdin_eof) {
+            f.exit_status = 1;
+            if (why) |w|
+                ulog.print("mcp-bridge: remote endpoint closed: {s}\n", .{w})
+            else
+                ulog.print("mcp-bridge: remote endpoint closed\n", .{});
+        }
+        self.fwdTeardown(f);
+        self.beginShutdown();
+    }
+
+    /// Close the remote fds/handles; never stage anything for them again.
+    /// The ssh child (if any) is killed and reaped.
+    fn fwdTeardown(self: *Bridge, f: *FwdState) void {
+        if (platform.is_windows) {
+            // Reader thread dies with the process; tell the writer to quit
+            // after draining (it closes the child's stdin handle itself).
+            f.relay_out.mutex.lock();
+            f.relay_out.quit = true;
+            f.relay_out.mutex.unlock();
+            if (f.relay_out.event) |e| _ = @import("win.zig").SetEvent(e);
+        } else {
+            if (f.rd_fd >= 0) {
+                self.evp.unmonitorRead(f.rd_fd);
+                if (f.rd_fd == f.wr_fd) self.evp.cancelWrite(f.rd_fd);
+                self.evp.purgeFd(f.rd_fd);
+                std.posix.close(f.rd_fd);
+                if (f.rd_fd == f.wr_fd) f.wr_fd = -1; // tcp: one fd, one close
+                f.rd_fd = -1;
+            }
+            if (f.wr_fd >= 0) {
+                self.evp.cancelWrite(f.wr_fd);
+                self.evp.purgeFd(f.wr_fd);
+                std.posix.close(f.wr_fd);
+                f.wr_fd = -1;
+            }
+        }
+        if (f.child) |c| {
+            // We closed (or the writer relay closed) the pipe ends already;
+            // disown them so Child.kill()'s cleanupStreams doesn't double-
+            // close (BADF panic). kill() terminates and collects the Term.
+            c.stdin = null;
+            c.stdout = null;
+            _ = c.kill() catch {};
+            self.alloc.destroy(c);
+            f.child = null;
+        }
+    }
+
+    /// Windows: child stdout reader relay — blocking ReadFile → mailbox +
+    /// completion post into the loop's IOCP. Dies with the process on exit.
+    fn fwdReaderMain(self: *Bridge) void {
+        const win = @import("win.zig");
+        const f = &self.fwd.?;
+        const h: win.HANDLE = f.child.?.stdout.?.handle;
+        var tmp: [4096]u8 = undefined;
+        while (true) {
+            var n: u32 = 0;
+            const ok = win.ReadFile(h, &tmp, tmp.len, &n, null);
+            f.relay_in.mutex.lock();
+            if (ok == 0 or n == 0) {
+                f.relay_in.eof = true;
+                f.relay_in.mutex.unlock();
+                self.evp.post(@as(*anyopaque, @constCast(&remote_sentinel)), null, 0);
+                return;
+            }
+            f.relay_in.buf.appendSlice(self.alloc, tmp[0..n]) catch {};
+            f.relay_in.mutex.unlock();
+            self.evp.post(@as(*anyopaque, @constCast(&remote_sentinel)), null, n);
+        }
+    }
+
+    /// Windows: child stdin writer relay — event-signaled queue drained by
+    /// blocking WriteFile; on quit it closes the handle so the remote
+    /// server sees stdin EOF and can exit.
+    fn fwdWriterMain(self: *Bridge) void {
+        const win = @import("win.zig");
+        const f = &self.fwd.?;
+        const h: win.HANDLE = f.child.?.stdin.?.handle;
+        const r = &f.relay_out;
+        while (true) {
+            _ = std.os.windows.WaitForSingleObject(r.event.?, win.INFINITE) catch {};
+            r.mutex.lock();
+            if (r.quit and r.queue.items.len == 0) {
+                r.mutex.unlock();
+                _ = win.CloseHandle(h);
+                return;
+            }
+            const chunk = r.queue.toOwnedSlice(self.alloc) catch {
+                r.mutex.unlock();
+                continue;
+            };
+            r.mutex.unlock();
+            var off: usize = 0;
+            while (off < chunk.len) {
+                var n: u32 = 0;
+                if (win.WriteFile(h, chunk.ptr + off, @intCast(chunk.len - off), &n, null) == 0) break;
+                off += n;
+            }
+            self.alloc.free(chunk);
+        }
+    }
+
+    /// Windows relay wake for the remote side from fwdReaderMain's posts.
+    fn onFwdEventWin(self: *Bridge) void {
+        const f = &self.fwd.?;
+        const r = &f.relay_in;
+        r.mutex.lock();
+        const eof = r.eof;
+        if (r.buf.items.len > 0) {
+            f.carry.appendSlice(self.alloc, r.buf.items) catch {};
+            r.buf.clearRetainingCapacity();
+        }
+        r.mutex.unlock();
+        self.fwdSplitServerLines();
+        if (eof and !f.remote_eof) self.fwdRemoteClosed(null);
     }
 
     fn setNonBlocking(fd: std.posix.fd_t) void {
@@ -598,6 +975,10 @@ pub const Bridge = struct {
                 self.onStdoutWritable();
                 continue;
             }
+            if (self.fwd != null and ev.udata == @as(?*anyopaque, &remote_sentinel)) {
+                self.onFwdEvent(ev);
+                continue;
+            }
             if (ev.udata) |ud| {
                 const conn: *httpc.Conn = @ptrCast(@alignCast(ud));
                 if (!conn.closing) {
@@ -684,6 +1065,16 @@ pub const Bridge = struct {
     fn beginShutdown(self: *Bridge) void {
         if (self.shutting_down) return;
         self.shutting_down = true;
+        if (self.fwd) |*f| {
+            // Forward mode: nothing upstream can deliver more than we can
+            // still print — close the remote side immediately (the ssh
+            // child is killed and reaped inside).
+            if (!f.remote_eof) {
+                f.remote_eof = true;
+                self.fwdTeardown(f);
+            }
+            return; // no conns exist in this mode; isDone() short-circuits
+        }
         if (self.leg_conn) |c| {
             c.close();
             self.leg_conn = null;
@@ -747,6 +1138,12 @@ pub const Bridge = struct {
                     return;
                 }
             }
+        }
+        if (self.fwd != null) {
+            // Remote stdio forward (issue #15): the line goes straight to
+            // the remote endpoint; no probing, no HTTP.
+            self.fwdClientLine(line);
+            return;
         }
         if (self.probe_via_get and !self.probed) {
             // sse_first probe in flight: queue until the transport resolves.
@@ -1964,6 +2361,30 @@ fn matchValueFlag(args: []const []const u8, i: *usize, long: []const u8, short: 
     return null;
 }
 
+/// Remote stdio forward run (issue #15): stdio+tcp / stdio+ssh target —
+/// plain line forwarding, no HTTP, no OAuth. Mirrors the tail of main().
+fn runForward(alloc: std.mem.Allocator, cfg: *const Config, ft: stdiofwd.Target) !void {
+    if (cfg.debug) {
+        if (oauth.tokensDir(alloc) catch null) |d| {
+            if (oauth.pathInDir(alloc, d, cfg.url, null, "_debug.log") catch null) |p|
+                ulog.openDebugFile(p);
+        }
+    }
+    var bridge = try Bridge.init(alloc, cfg, undefined, null);
+    bridge.out = bridge.queuedOut();
+    bridge.fwd = .{ .target = ft };
+    defer bridge.deinit();
+    bridge.attachStdio();
+    bridge.fwdStart() catch |err| {
+        log.err("cannot start the forward target: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    ulog.vprint("mcp-bridge: event loop starting\n", .{});
+    try bridge.run();
+    bridge.shutdownStdio();
+    std.process.exit(bridge.fwd.?.exit_status);
+}
+
 pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa_state.allocator();
@@ -1981,6 +2402,8 @@ pub fn main() !void {
     var oauth_logout = false;
     var transport_flag: ?[]const u8 = null;
     var config_path: ?[]const u8 = null;
+    var extra_positional: std.ArrayList([]const u8) = .empty;
+    defer extra_positional.deinit(alloc);
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -2106,11 +2529,33 @@ pub fn main() !void {
         } else if (url == null) {
             url = a;
         } else {
-            usage();
+            try extra_positional.append(alloc, a);
         }
     }
-    cfg.target = parseUrl(url orelse usage()) catch usage();
-    cfg.url = url.?;
+    const u = url orelse usage();
+    if (stdiofwd.parse(alloc, u, extra_positional.items) catch {
+        log.err("invalid stdio target '{s}'", .{u});
+        usage();
+    }) |ft| {
+        if (cfg.headers.items.len > 0 or oauth_flag or oauth_client_id != null or
+            oauth_client_secret != null or oauth_scope != null or oauth_grant != null or
+            oauth_resource != null or oauth_logout or transport_flag != null or
+            config_path != null or cfg.enable_proxy or cfg.static_metadata != null or
+            cfg.callback_host != null)
+        {
+            log.err("stdio forward mode accepts only --ignore-tool, --verbose/-v, --silent and --debug", .{});
+            usage();
+        }
+        if (extra_positional.items.len > 0 and std.meta.activeTag(ft) != .ssh) {
+            log.err("trailing arguments are only valid with stdio+ssh://", .{});
+            usage();
+        }
+        cfg.url = u;
+        return runForward(alloc, &cfg, ft);
+    }
+    if (extra_positional.items.len > 0) usage(); // extra args are stdio+ssh-only
+    cfg.target = parseUrl(u) catch usage();
+    cfg.url = u;
     ulog.verbose = cfg.verbose;
     ulog.silent = cfg.silent;
     if (cfg.enable_proxy) proxy.initFromEnv(alloc);
