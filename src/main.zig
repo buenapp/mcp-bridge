@@ -200,19 +200,13 @@ pub const Bridge = struct {
     stdin_carry: std.ArrayList(u8) = .empty,
     stdin_active: bool = false, // fd 0 registered on the port
     stdin_eof: bool = false,
-    /// POSIX: stdin is a regular file, which epoll(7) refuses to register
-    /// (EPERM). Such a sink never blocks, so it is pumped straight through
-    /// at the top of run() instead of by event (issue #18).
-    stdin_direct: bool = false,
 
     // ---- stdout write queue (production; tests use a memory sink) ----
     stdout_q: std.ArrayList(u8) = .empty,
     stdout_is_fd: bool = false,
-    /// stdout is a sink the event port cannot report writability for —
-    /// a Windows disk file/console, or a POSIX regular file, which
-    /// epoll(7) rejects with EPERM. Writes to such a sink never block, so
-    /// queueStdout writes them directly instead of queueing output that
-    /// would never drain (a bare `> log.txt`, issue #18).
+    /// Windows only: stdout is a disk file or console (not an IDE pipe) —
+    /// queueStdout writes it directly with blocking WriteFile instead of
+    /// silently discarding output like a bare `> log.txt` would hit.
     stdout_direct: bool = false,
     stdout_dead: bool = false, // EPIPE: the IDE is gone; drop queued output
 
@@ -371,25 +365,11 @@ pub const Bridge = struct {
             self.attachStdioWin();
             return;
         }
-        // epoll(7) rejects regular files with EPERM and kqueue reports
-        // them as perpetually ready; either way there is no readiness edge
-        // to wait for, because I/O on a regular file never returns EAGAIN.
-        // Registering one silently drops the interest and the loop then
-        // waits forever (issue #18) — so pump those sinks directly.
-        self.stdout_direct = isRegularFile(std.posix.STDOUT_FILENO);
-        self.stdin_direct = isRegularFile(std.posix.STDIN_FILENO);
-        self.stdout_is_fd = true;
-        if (!self.stdout_direct) setNonBlocking(std.posix.STDOUT_FILENO);
-        if (self.stdin_direct) return; // drained by pumpStdinDirect in run()
         setNonBlocking(std.posix.STDIN_FILENO);
+        setNonBlocking(std.posix.STDOUT_FILENO);
         self.evp.monitorRead(std.posix.STDIN_FILENO, @as(?*anyopaque, &stdin_sentinel));
         self.stdin_active = true;
-    }
-
-    /// True for a sink no readiness mechanism can usefully report on.
-    fn isRegularFile(fd: std.posix.fd_t) bool {
-        const st = std.posix.fstat(fd) catch return false;
-        return std.posix.S.ISREG(st.mode);
+        self.stdout_is_fd = true;
     }
 
     fn attachStdioWin(self: *Bridge) void {
@@ -906,22 +886,6 @@ pub const Bridge = struct {
             return;
         }
         if (self.stdout_dead) return;
-        if (self.stdout_direct) {
-            // Regular file: write(2) completes in full, never EAGAIN.
-            var off: usize = 0;
-            while (off < bytes.len) {
-                const n = std.posix.write(std.posix.STDOUT_FILENO, bytes[off..]) catch {
-                    self.stdout_dead = true;
-                    return;
-                };
-                if (n == 0) {
-                    self.stdout_dead = true;
-                    return;
-                }
-                off += n;
-            }
-            return;
-        }
         self.stdout_q.appendSlice(self.alloc, bytes) catch {};
         self.evp.wantWrite(std.posix.STDOUT_FILENO, @as(?*anyopaque, &stdout_sentinel));
     }
@@ -1097,28 +1061,7 @@ pub const Bridge = struct {
     /// Run until shutdown completes (stdin EOF + all conns drained +
     /// stdout queue flushed) or a fatal error.
     pub fn run(self: *Bridge) !void {
-        // A regular-file stdin carries no readiness edge, and by now the
-        // upstream (forward target or HTTP conn) is started, so its lines
-        // can be dispatched straight through before the wait loop. The
-        // comptime gate keeps the POSIX fd constants out of the Windows
-        // build, as elsewhere in this file.
-        if (!platform.is_windows) {
-            if (self.stdin_direct and !self.stdin_eof) self.pumpStdinDirect();
-        }
         while (!self.isDone()) try self.step(null);
-    }
-
-    /// Read a regular-file stdin to EOF, dispatching lines as they come.
-    fn pumpStdinDirect(self: *Bridge) void {
-        var tmp: [16384]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(std.posix.STDIN_FILENO, &tmp) catch break;
-            if (n == 0) break;
-            self.stdin_carry.appendSlice(self.alloc, tmp[0..n]) catch {};
-            self.splitLines();
-            if (self.stdin_eof) return; // shutdown began mid-batch
-        }
-        self.onStdinEof();
     }
 
     pub fn isDone(self: *Bridge) bool {
