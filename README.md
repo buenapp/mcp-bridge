@@ -205,6 +205,50 @@ mcp-bridge stdio+ssh://admin@host:2222/opt/bin/vnc-mcp-server --verbose
   `bash`, `zsh`, `ksh`) is the supported configuration — set one with
   `chsh`, or point `stdio+ssh://` at a wrapper script.
 
+### SSH options, keepalive, and connection reuse
+
+The bridge runs your system `ssh` and does **not** pass `-F`, so your
+`~/.ssh/config` applies in full — host aliases, `User`, `IdentityFile`,
+`ProxyJump`, and everything below. That is the place to configure the
+ssh hop; there is no flag for it on the bridge (forward mode accepts only
+`--ignore-tool`, `--verbose`/`-v`, `--silent` and `--debug`).
+
+The bridge sets three options on the command line, which therefore
+**override** anything you put in the config file for them: `-T` (no pty —
+a pty would echo and mangle the line protocol), `BatchMode=yes` (never
+hang an IDE waiting on a prompt) and `ConnectTimeout=10`. Everything else
+is yours.
+
+**Keepalive.** OpenSSH ships with `ServerAliveInterval 0`, i.e. off, and
+`TCPKeepAlive yes` does not probe until roughly two hours of idle on
+Linux. An MCP session idles for long stretches, so a firewall or NAT can
+drop the connection with neither end noticing. Without keepalive the
+bridge then blocks on the next request until the client gives up; with it,
+ssh notices, exits, and the bridge reports `remote endpoint closed` and
+exits 1 — a clean failure the client can act on:
+
+```sshconfig
+Host freebsd-dev1
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+```
+
+**Connection reuse.** Every spawn pays a full ssh handshake — about 0.9 s
+on a LAN. Agents that terminate an idle stdio server and respawn it later
+pay that on each restart. Multiplexing amortises it to about 0.15 s, since
+the TCP connection and authentication are reused (the remote command still
+starts fresh each time):
+
+```sshconfig
+Host freebsd-dev1
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 10m
+```
+
+Keep `ControlPath` short — the socket path has a hard limit near 108
+bytes and ssh fails outright when it is exceeded.
+
 ## OAuth 2.1
 
 When a server answers **401 Unauthorized** (or `--oauth` / a config entry
