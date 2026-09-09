@@ -332,6 +332,9 @@ pub const Bridge = struct {
         quit: bool = false,
         dead: bool = false, // EPIPE: the IDE is gone
         thread: ?std.Thread = null,
+        /// Windows: the real STD_OUTPUT_HANDLE, resolved on the loop thread
+        /// before the writer starts — same reasoning as StdinRelay.handle.
+        handle: ?@import("win.zig").HANDLE = null,
     };
 
     /// Everything about a stdio+tcp / stdio+ssh upstream. Owns the remote
@@ -366,6 +369,11 @@ pub const Bridge = struct {
         /// handed a pre-made handle, and its own synchronous stdin pipe is
         /// one Win32-OpenSSH never reads (issue #23).
         win_stdin_wr: ?@import("win.zig").HANDLE = null,
+        /// Windows: read end of the SYNCHRONOUS pipe carrying the child's
+        /// stdout. Child builds that pipe with FILE_FLAG_OVERLAPPED, and a
+        /// blocking ReadFile with a null OVERLAPPED on such a handle is
+        /// undefined — it completed once and then wedged (issue #23).
+        win_stdout_rd: ?@import("win.zig").HANDLE = null,
     };
 
     /// Production: wire up stdin + stdout for the loop.
@@ -390,6 +398,7 @@ pub const Bridge = struct {
             if (win.GetFileType(stdout_h.?) == win.FILE_TYPE_PIPE) {
                 // Stdout writer relay: event-signaled queue drained by blocking
                 // WriteFile off the loop thread.
+                self.stdout_relay.handle = stdout_h.?;
                 self.stdout_relay.event = win.CreateEventExW(null, null, 0, 0x1F0003); // EVENT_ALL_ACCESS
                 if (self.stdout_relay.event != null) {
                     self.stdout_relay.thread = std.Thread.spawn(.{}, stdoutWriterMain, .{self}) catch null;
@@ -437,7 +446,8 @@ pub const Bridge = struct {
     /// WriteFile. EPIPE/closed stdout ends the thread.
     fn stdoutWriterMain(self: *Bridge) void {
         const win = @import("win.zig");
-        const h = win.GetStdHandle(win.STD_OUTPUT_HANDLE).?;
+        // Never GetStdHandle here: see StdoutRelay.handle.
+        const h = self.stdout_relay.handle orelse return;
         const r = &self.stdout_relay;
         while (true) {
             _ = std.os.windows.WaitForSingleObject(r.event.?, win.INFINITE) catch {};
@@ -594,6 +604,29 @@ pub const Bridge = struct {
         return .{ .rd = rd, .wr = wr };
     }
 
+    /// Windows: the pipe carrying the ssh child's stdout. Deliberately a
+    /// plain synchronous pipe: the relay reads it with a blocking ReadFile,
+    /// which is only valid on a handle NOT opened FILE_FLAG_OVERLAPPED.
+    /// Returns .{ rd, wr } — rd is ours, wr is the child's.
+    fn winMakeStdoutPipe() !struct { rd: std.os.windows.HANDLE, wr: std.os.windows.HANDLE } {
+        const w = std.os.windows;
+        var sa = w.SECURITY_ATTRIBUTES{
+            .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = null,
+            .bInheritHandle = w.TRUE,
+        };
+        var rd: w.HANDLE = undefined;
+        var wr: w.HANDLE = undefined;
+        w.CreatePipe(&rd, &wr, &sa) catch return error.SpawnFailed;
+        errdefer {
+            w.CloseHandle(rd);
+            w.CloseHandle(wr);
+        }
+        // Our read end stays private; only the child's write end is inherited.
+        w.SetHandleInformation(rd, w.HANDLE_FLAG_INHERIT, 0) catch return error.SpawnFailed;
+        return .{ .rd = rd, .wr = wr };
+    }
+
     fn fwdStartSsh(self: *Bridge, s: *const stdiofwd.Ssh) !void {
         const f = &self.fwd.?;
         const argv = try s.sshArgv(self.alloc);
@@ -611,19 +644,34 @@ pub const Bridge = struct {
             // else reads this slot.
             const w = std.os.windows;
             const win_mod = @import("win.zig");
-            const pipe = try winMakeStdinPipe();
-            const saved = win_mod.GetStdHandle(w.STD_INPUT_HANDLE);
+            const in_pipe = try winMakeStdinPipe();
+            const out_pipe = try winMakeStdoutPipe();
+            const saved_in = win_mod.GetStdHandle(w.STD_INPUT_HANDLE);
+            const saved_out = win_mod.GetStdHandle(w.STD_OUTPUT_HANDLE);
             child.stdin_behavior = .Inherit;
-            _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, pipe.rd);
+            child.stdout_behavior = .Inherit;
+            _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, in_pipe.rd);
+            _ = win_mod.SetStdHandle(w.STD_OUTPUT_HANDLE, out_pipe.wr);
+            const restore = struct {
+                fn call(m: anytype, ww: anytype, si: ?std.os.windows.HANDLE, so: ?std.os.windows.HANDLE) void {
+                    if (si) |h| _ = m.SetStdHandle(ww.STD_INPUT_HANDLE, h);
+                    if (so) |h| _ = m.SetStdHandle(ww.STD_OUTPUT_HANDLE, h);
+                }
+            }.call;
             child.spawn() catch |err| {
-                if (saved) |h| _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, h);
-                w.CloseHandle(pipe.rd);
-                w.CloseHandle(pipe.wr);
+                restore(win_mod, w, saved_in, saved_out);
+                w.CloseHandle(in_pipe.rd);
+                w.CloseHandle(in_pipe.wr);
+                w.CloseHandle(out_pipe.rd);
+                w.CloseHandle(out_pipe.wr);
                 return err;
             };
-            if (saved) |h| _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, h);
-            w.CloseHandle(pipe.rd); // the child holds its own copy now
-            f.win_stdin_wr = pipe.wr;
+            restore(win_mod, w, saved_in, saved_out);
+            // The child holds its own inherited copies now.
+            w.CloseHandle(in_pipe.rd);
+            w.CloseHandle(out_pipe.wr);
+            f.win_stdin_wr = in_pipe.wr;
+            f.win_stdout_rd = out_pipe.rd;
         } else {
             child.stdin_behavior = .Pipe;
             try child.spawn();
@@ -863,6 +911,12 @@ pub const Bridge = struct {
                     f.win_stdin_wr = null;
                 }
             }
+            // Closing our read end makes the reader's blocking ReadFile
+            // return, so the thread cannot outlive the bridge.
+            if (f.win_stdout_rd) |rh| {
+                _ = @import("win.zig").CloseHandle(rh);
+                f.win_stdout_rd = null;
+            }
         } else {
             if (f.rd_fd >= 0) {
                 self.evp.unmonitorRead(f.rd_fd);
@@ -896,7 +950,7 @@ pub const Bridge = struct {
     fn fwdReaderMain(self: *Bridge) void {
         const win = @import("win.zig");
         const f = &self.fwd.?;
-        const h: win.HANDLE = f.child.?.stdout.?.handle;
+        const h: win.HANDLE = f.win_stdout_rd orelse return;
         var tmp: [4096]u8 = undefined;
         while (true) {
             var n: u32 = 0;
@@ -934,6 +988,12 @@ pub const Bridge = struct {
                     const done = r.quit;
                     r.mutex.unlock();
                     if (done) {
+                        // Named pipes discard bytes the reader has not
+                        // consumed when the writing handle closes, so the
+                        // remote saw EOF partway through the batch and shut
+                        // down mid-handshake. Block until the child has
+                        // taken everything, THEN signal EOF (issue #23).
+                        _ = win.FlushFileBuffers(h);
                         _ = win.CloseHandle(h);
                         return;
                     }

@@ -57,6 +57,7 @@ pub extern "kernel32" fn CreateEventExW(
 ) ?HANDLE;
 pub extern "kernel32" fn SetEvent(hEvent: HANDLE) BOOL;
 pub extern "kernel32" fn CloseHandle(hObject: HANDLE) BOOL;
+pub extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) BOOL;
 
 // --------------------------------------------------------------- winsock --
 
