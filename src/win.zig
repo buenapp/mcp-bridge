@@ -24,6 +24,7 @@ pub const STD_OUTPUT_HANDLE: DWORD = @bitCast(@as(i32, -11));
 pub const STD_ERROR_HANDLE: DWORD = @bitCast(@as(i32, -12));
 
 pub extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) ?HANDLE;
+pub extern "kernel32" fn SetStdHandle(nStdHandle: DWORD, hHandle: HANDLE) BOOL;
 pub extern "kernel32" fn ReadFile(
     hFile: HANDLE,
     lpBuffer: [*]u8,

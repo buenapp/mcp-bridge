@@ -317,6 +317,12 @@ pub const Bridge = struct {
         buf: std.ArrayList(u8) = .empty,
         eof: bool = false,
         thread: ?std.Thread = null,
+        /// Windows: the real STD_INPUT_HANDLE, resolved on the loop thread
+        /// BEFORE the reader thread starts. Resolving it inside the thread
+        /// races fwdStartSsh's temporary SetStdHandle swap, and the reader
+        /// would then consume the ssh child's stdin pipe instead of ours
+        /// (issue #23).
+        handle: ?@import("win.zig").HANDLE = null,
     };
 
     pub const StdoutRelay = struct {
@@ -355,6 +361,11 @@ pub const Bridge = struct {
         // they get the same reader/writer relay treatment as IDE stdio.
         relay_in: StdinRelay = .{}, // child stdout → loop mailbox
         relay_out: StdoutRelay = .{}, // loop → child stdin queue
+        /// Windows: write end of the OVERLAPPED pipe serving as the ssh
+        /// child's stdin. Owned here because std.process.Child cannot be
+        /// handed a pre-made handle, and its own synchronous stdin pipe is
+        /// one Win32-OpenSSH never reads (issue #23).
+        win_stdin_wr: ?@import("win.zig").HANDLE = null,
     };
 
     /// Production: wire up stdin + stdout for the loop.
@@ -394,6 +405,7 @@ pub const Bridge = struct {
         const stdin_h = win.GetStdHandle(win.STD_INPUT_HANDLE);
         if (stdin_h == null) return;
         if (win.GetFileType(stdin_h.?) != win.FILE_TYPE_PIPE) return; // console: manual OAuth runs have no loop stdin
+        self.stdin_relay.handle = stdin_h.?;
         self.stdin_relay.thread = std.Thread.spawn(.{}, stdinReaderMain, .{self}) catch null;
         self.stdin_active = self.stdin_relay.thread != null;
     }
@@ -402,7 +414,8 @@ pub const Bridge = struct {
     /// completion post into the loop's IOCP. Exits on EOF/read error.
     fn stdinReaderMain(self: *Bridge) void {
         const win = @import("win.zig");
-        const h = win.GetStdHandle(win.STD_INPUT_HANDLE).?;
+        // Never GetStdHandle here: see StdinRelay.handle.
+        const h = self.stdin_relay.handle orelse return;
         var tmp: [4096]u8 = undefined;
         while (true) {
             var n: u32 = 0;
@@ -522,16 +535,99 @@ pub const Bridge = struct {
         return last_err;
     }
 
+    /// Windows: build the pipe that becomes the ssh child's stdin.
+    ///
+    /// std.process.Child's `.Pipe` stdin is a synchronous anonymous pipe
+    /// (windowsMakePipeIn -> CreatePipe), and Win32-OpenSSH never reports
+    /// such a handle readable, so writes land in the buffer and are never
+    /// consumed — WriteFile succeeds and the remote sees nothing. Its
+    /// stdout/stderr work only because Child builds *those* with
+    /// FILE_FLAG_OVERLAPPED. So build stdin the same way: an overlapped
+    /// named pipe whose read end is inheritable (issue #23).
+    ///
+    /// Returns .{ rd, wr } — rd is the child's end, wr is ours.
+    fn winMakeStdinPipe() !struct { rd: std.os.windows.HANDLE, wr: std.os.windows.HANDLE } {
+        const w = std.os.windows;
+        var name8: [128]u8 = undefined;
+        var name16: [128]u16 = undefined;
+        const path = std.fmt.bufPrintZ(&name8, "\\\\.\\pipe\\mcp-bridge-fwdin-{d}-{d}", .{
+            w.GetCurrentProcessId(), std.time.milliTimestamp(),
+        }) catch return error.SpawnFailed;
+        const n = std.unicode.wtf8ToWtf16Le(&name16, path) catch return error.SpawnFailed;
+        name16[n] = 0;
+        const name: [:0]const u16 = name16[0..n :0];
+
+        // The child inherits the read end; our write end must not leak.
+        var sa_inherit = w.SECURITY_ATTRIBUTES{
+            .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = null,
+            .bInheritHandle = w.TRUE,
+        };
+        const rd = w.kernel32.CreateNamedPipeW(
+            name.ptr,
+            w.PIPE_ACCESS_INBOUND | w.FILE_FLAG_OVERLAPPED,
+            w.PIPE_TYPE_BYTE | w.PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            &sa_inherit,
+        );
+        if (rd == w.INVALID_HANDLE_VALUE) return error.SpawnFailed;
+        errdefer w.CloseHandle(rd);
+
+        var sa_private = w.SECURITY_ATTRIBUTES{
+            .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = null,
+            .bInheritHandle = w.FALSE,
+        };
+        const wr = w.kernel32.CreateFileW(
+            name.ptr,
+            w.GENERIC_WRITE,
+            0,
+            &sa_private,
+            w.OPEN_EXISTING,
+            w.FILE_ATTRIBUTE_NORMAL,
+            null,
+        );
+        if (wr == w.INVALID_HANDLE_VALUE) return error.SpawnFailed;
+        return .{ .rd = rd, .wr = wr };
+    }
+
     fn fwdStartSsh(self: *Bridge, s: *const stdiofwd.Ssh) !void {
         const f = &self.fwd.?;
         const argv = try s.sshArgv(self.alloc);
         ulog.vprint("mcp-bridge: forward ssh spawn: ssh ... {s}\n", .{argv[argv.len - 1]});
         const child = try self.alloc.create(std.process.Child);
         child.* = std.process.Child.init(argv, self.alloc);
-        child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit; // ssh's diagnostics reach the IDE log
-        try child.spawn();
+        if (platform.is_windows) {
+            // Child offers no way to supply a stdin handle, and the one it
+            // makes is unreadable to ssh (issue #23). `.Inherit` makes it
+            // take STD_INPUT_HANDLE, so swap ours in across the spawn and
+            // put it straight back. Safe here: attachStdio() already ran and
+            // the stdin relay captured the real handle by value, so nothing
+            // else reads this slot.
+            const w = std.os.windows;
+            const win_mod = @import("win.zig");
+            const pipe = try winMakeStdinPipe();
+            const saved = win_mod.GetStdHandle(w.STD_INPUT_HANDLE);
+            child.stdin_behavior = .Inherit;
+            _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, pipe.rd);
+            child.spawn() catch |err| {
+                if (saved) |h| _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, h);
+                w.CloseHandle(pipe.rd);
+                w.CloseHandle(pipe.wr);
+                return err;
+            };
+            if (saved) |h| _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, h);
+            w.CloseHandle(pipe.rd); // the child holds its own copy now
+            f.win_stdin_wr = pipe.wr;
+        } else {
+            child.stdin_behavior = .Pipe;
+            try child.spawn();
+        }
         f.child = child;
         if (platform.is_windows) {
             // Anonymous pipes: reader/writer relay threads (same pattern as
@@ -758,6 +854,15 @@ pub const Bridge = struct {
             f.relay_out.quit = true;
             f.relay_out.mutex.unlock();
             if (f.relay_out.event) |e| _ = @import("win.zig").SetEvent(e);
+            // The writer closes it on a clean drain; if it never ran (spawn
+            // failure, immediate teardown) the handle would otherwise leak
+            // and the child would never see stdin EOF.
+            if (f.relay_out.thread == null) {
+                if (f.win_stdin_wr) |wh| {
+                    _ = @import("win.zig").CloseHandle(wh);
+                    f.win_stdin_wr = null;
+                }
+            }
         } else {
             if (f.rd_fd >= 0) {
                 self.evp.unmonitorRead(f.rd_fd);
@@ -815,28 +920,39 @@ pub const Bridge = struct {
     fn fwdWriterMain(self: *Bridge) void {
         const win = @import("win.zig");
         const f = &self.fwd.?;
-        const h: win.HANDLE = f.child.?.stdin.?.handle;
+        const h: win.HANDLE = f.win_stdin_wr orelse return;
         const r = &f.relay_out;
         while (true) {
             _ = std.os.windows.WaitForSingleObject(r.event.?, win.INFINITE) catch {};
-            r.mutex.lock();
-            if (r.quit and r.queue.items.len == 0) {
+            // Drain to empty before waiting again. The event is auto-reset,
+            // so a queue append and a quit set back-to-back collapse into a
+            // SINGLE wake; the old code handled one chunk per wake and then
+            // blocked forever, never closing the child's stdin (issue #23).
+            while (true) {
+                r.mutex.lock();
+                if (r.queue.items.len == 0) {
+                    const done = r.quit;
+                    r.mutex.unlock();
+                    if (done) {
+                        _ = win.CloseHandle(h);
+                        return;
+                    }
+                    break; // nothing staged: wait for the next signal
+                }
+                const chunk = r.queue.toOwnedSlice(self.alloc) catch {
+                    r.mutex.unlock();
+                    break;
+                };
                 r.mutex.unlock();
-                _ = win.CloseHandle(h);
-                return;
+                var off: usize = 0;
+                while (off < chunk.len) {
+                    var n: u32 = 0;
+                    const wok = win.WriteFile(h, chunk.ptr + off, @intCast(chunk.len - off), &n, null);
+                    if (wok == 0) break;
+                    off += n;
+                }
+                self.alloc.free(chunk);
             }
-            const chunk = r.queue.toOwnedSlice(self.alloc) catch {
-                r.mutex.unlock();
-                continue;
-            };
-            r.mutex.unlock();
-            var off: usize = 0;
-            while (off < chunk.len) {
-                var n: u32 = 0;
-                if (win.WriteFile(h, chunk.ptr + off, @intCast(chunk.len - off), &n, null) == 0) break;
-                off += n;
-            }
-            self.alloc.free(chunk);
         }
     }
 
