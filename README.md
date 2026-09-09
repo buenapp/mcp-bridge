@@ -190,9 +190,20 @@ mcp-bridge stdio+ssh://admin@host:2222/opt/bin/vnc-mcp-server --verbose
 - `--ignore-tool` still filters `tools/list` both ways. HTTP-only flags
   (`--header`, `--oauth*`, `--transport`, ...) are rejected in this mode —
   there is no HTTP leg for them to act on.
+- Shutdown is a half-close: when the IDE closes stdin the bridge closes
+  only its write side to the remote (the ssh child's stdin, or `SHUT_WR`
+  on the tcp socket), so the remote server sees its own stdin EOF and
+  exits cleanly. Replies still in flight are relayed until the remote
+  closes its end, then the bridge exits.
 - Exit status is 0 when the IDE closed stdin (normal) and 1 when the
   remote endpoint died mid-session (connect refused, server crash, ssh
   failure).
+- `ssh` runs the remote command through the **remote account's login
+  shell**, and the command string the bridge builds is POSIX-sh quoted.
+  Non-POSIX login shells (`fish`, `csh`) handle the common cases the same
+  way, but a remote account whose login shell is POSIX-compatible (`sh`,
+  `bash`, `zsh`, `ksh`) is the supported configuration — set one with
+  `chsh`, or point `stdio+ssh://` at a wrapper script.
 
 ## OAuth 2.1
 

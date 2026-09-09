@@ -11,6 +11,7 @@ const std = @import("std");
 const main_mod = @import("main.zig");
 const http = @import("http.zig");
 const mcp = @import("mcp.zig");
+const stdiofwd = @import("stdiofwd.zig");
 
 const Bridge = main_mod.Bridge;
 const Config = main_mod.Config;
@@ -104,6 +105,72 @@ fn mockLegacyMain(mock: *Mock) void {
     writeAll(&c_get.stream, "event: message\nid: ev-1\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n") catch return;
 
     drainUntilClose(&c_get.stream);
+}
+
+// ------------------------------------------- mock: forward stdio target ----
+
+/// A line-framed stdio MCP server behind a socket. It deliberately holds
+/// its reply back until the client half-closes: the response is only
+/// written after recv() reports EOF. That makes the test fail unless the
+/// bridge really does SHUT_WR on stdin EOF and keeps its read side open
+/// afterwards (issue #18) — a bridge that instead tears the socket down
+/// gets nothing, and one that never half-closes deadlocks here.
+fn mockFwdLateReplyMain(mock: *Mock) void {
+    var c = mock.server.accept() catch return;
+    defer sockClose(&c.stream);
+    var buf: [4096]u8 = undefined;
+    var seen: usize = 0;
+    while (true) {
+        const n = sockRead(&c.stream, buf[seen..]) catch return;
+        if (n == 0) break; // client half-closed: its stdin ended
+        seen += n;
+        if (seen == buf.len) break;
+    }
+    if (std.mem.indexOf(u8, buf[0..seen], "\"id\":7") == null) return;
+    writeAll(&c.stream, "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"late\":true}}\n") catch return;
+}
+
+test "forward stdio+tcp: stdin EOF half-closes, late reply still delivered" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mockFwdLateReplyMain);
+
+    var collector = Collector{ .alloc = alloc };
+    defer collector.deinit();
+
+    const url = try std.fmt.allocPrint(alloc, "stdio+tcp://127.0.0.1:{d}", .{mock.port()});
+    defer alloc.free(url);
+    const ft = (try stdiofwd.parse(alloc, url, &.{})).?;
+
+    var cfg = Config{ .target = undefined, .url = url };
+    var bridge = try Bridge.init(alloc, &cfg, collector.out(), null);
+    defer bridge.deinit();
+    try bridge.startForward(ft);
+
+    bridge.injectLine("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}");
+
+    // stdin EOF must NOT kill the remote: it only closes our write side.
+    bridge.stdinEof();
+    try std.testing.expect(bridge.shutting_down);
+    try std.testing.expect(!bridge.isDone()); // remote has not closed yet
+
+    // The reply the server withheld until the half-close still arrives.
+    try std.testing.expect(waitFor(&bridge, &collector, "\"id\":7,\"result\":{\"late\":true}"));
+
+    // And only then does the bridge consider itself finished.
+    try std.testing.expect(stepUntil(&bridge, struct {
+        fn f(b: *Bridge) bool {
+            return b.isDone();
+        }
+    }.f));
+    // A clean remote close after stdin EOF is not an error exit.
+    try std.testing.expect(bridge.fwd.?.exit_status == 0);
+    try std.testing.expect(bridge.fwd.?.wr_eof);
+
+    mock.join();
 }
 
 test "legacy SSE: endpoint discovery, async response, server push" {
