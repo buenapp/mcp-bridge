@@ -285,6 +285,15 @@ pub const Bridge = struct {
             self.stdin_carry.deinit(self.alloc);
             self.stdout_q.deinit(self.alloc);
         }
+        if (self.fwd) |*f| {
+            // Same rule as the stdio relays above: on Windows these buffers
+            // are shared with threads that are still blocked, so only the
+            // POSIX ones can be released here.
+            if (!platform.is_windows) {
+                f.write_q.deinit(self.alloc);
+                f.carry.deinit(self.alloc);
+            }
+        }
         if (self.session_id) |sid| self.alloc.free(sid);
         if (self.leg_endpoint_url) |u| self.alloc.free(u);
         if (self.leg_last_event_id) |i| self.alloc.free(i);
@@ -332,6 +341,13 @@ pub const Bridge = struct {
         carry: std.ArrayList(u8) = .empty, // remote→client line assembly
         child: ?*std.process.Child = null, // ssh (both OSes)
         remote_eof: bool = false,
+        /// stdin EOF seen: close the write half toward the remote as soon
+        /// as `write_q` drains, so the remote server sees its own stdin
+        /// EOF and can exit on its own (issue #18).
+        wr_shutdown_pending: bool = false,
+        /// The write half is closed (ssh: child stdin pipe; tcp: SHUT_WR).
+        /// The read half stays armed until the remote closes it.
+        wr_eof: bool = false,
         /// Set when the remote end died while the IDE session was live:
         /// surfaced as the bridge's exit status.
         exit_status: u8 = 0,
@@ -589,6 +605,7 @@ pub const Bridge = struct {
     fn fwdDrainWrites(self: *Bridge) void {
         if (platform.is_windows) unreachable;
         const f = &self.fwd.?;
+        if (f.wr_eof or f.wr_fd < 0) return;
         const MSG_NOSIGNAL: u32 = switch (@import("builtin").os.tag) {
             .freebsd => 0x00020000,
             .linux => 0x00004000,
@@ -622,6 +639,47 @@ pub const Bridge = struct {
             f.write_q.items.len = rest;
         }
         self.evp.cancelWrite(f.wr_fd);
+        // Everything queued is on the wire: if stdin already ended, the
+        // remote's stdin can now be closed (issue #18).
+        if (f.wr_shutdown_pending) self.fwdShutdownWrite();
+    }
+
+    /// Half-close toward the remote after stdin EOF: the remote server
+    /// gets its own stdin EOF (and so exits and flushes), while our read
+    /// half stays armed so its final replies still reach the IDE. Deferred
+    /// until `write_q` is empty and, for tcp, until the connect resolved.
+    fn fwdShutdownWrite(self: *Bridge) void {
+        const f = &self.fwd.?;
+        if (f.wr_eof or !f.wr_shutdown_pending) return;
+        if (platform.is_windows) {
+            // The writer relay owns the handle: it closes it once the
+            // queue it holds has drained.
+            const r = &f.relay_out;
+            r.mutex.lock();
+            r.quit = true;
+            r.mutex.unlock();
+            if (r.event) |e| _ = @import("win.zig").SetEvent(e);
+            f.wr_eof = true;
+            ulog.vprint("mcp-bridge: forward: stdin EOF -> closing remote stdin\n", .{});
+            return;
+        }
+        if (!f.connected) return; // tcp EINPROGRESS: retried once connected
+        if (f.write_q.items.len > 0) return; // retried from fwdDrainWrites
+        if (f.wr_fd < 0) return;
+        if (f.rd_fd == f.wr_fd) {
+            // tcp: one socket for both directions — half-close it.
+            std.posix.shutdown(f.wr_fd, .send) catch {};
+        } else {
+            // ssh: a separate pipe — closing it IS the child's stdin EOF.
+            self.evp.cancelWrite(f.wr_fd);
+            self.evp.purgeFd(f.wr_fd);
+            std.posix.close(f.wr_fd);
+            // Disowned so fwdTeardown/Child.kill never double-close it.
+            if (f.child) |c| c.stdin = null;
+            f.wr_fd = -1;
+        }
+        f.wr_eof = true;
+        ulog.vprint("mcp-bridge: forward: stdin EOF -> closing remote stdin\n", .{});
     }
 
     /// POSIX: remote readable — drain, split lines, deliver via the
@@ -953,6 +1011,13 @@ pub const Bridge = struct {
         self.onStdinEof();
     }
 
+    /// Test hook: enter forward mode against `ft` without attachStdio
+    /// claiming the process's real stdin/stdout (the Out sink stands in).
+    pub fn startForward(self: *Bridge, ft: stdiofwd.Target) !void {
+        self.fwd = .{ .target = ft };
+        try self.fwdStart();
+    }
+
     /// Test hook: feed one stdin line.
     pub fn injectLine(self: *Bridge, line: []const u8) void {
         self.handleLine(line);
@@ -999,8 +1064,15 @@ pub const Bridge = struct {
         while (!self.isDone()) try self.step(null);
     }
 
-    fn isDone(self: *Bridge) bool {
+    pub fn isDone(self: *Bridge) bool {
         if (!self.shutting_down) return false;
+        if (self.fwd) |*f| {
+            // The remote still owes replies to whatever was in flight when
+            // stdin ended; we are done only once it closes its own end and
+            // everything it sent has reached stdout (issue #18).
+            if (!f.remote_eof) return false;
+            return self.stdoutDrained();
+        }
         if (self.conns.items.len != 0) return false;
         if (!self.stdoutDrained()) return false;
         return true;
@@ -1066,14 +1138,16 @@ pub const Bridge = struct {
         if (self.shutting_down) return;
         self.shutting_down = true;
         if (self.fwd) |*f| {
-            // Forward mode: nothing upstream can deliver more than we can
-            // still print — close the remote side immediately (the ssh
-            // child is killed and reaped inside).
+            // Forward mode: stdin EOF means the IDE will send nothing more,
+            // NOT that the remote has nothing left to say — in-flight
+            // requests still owe us replies. Half-close the write side so
+            // the remote sees its own stdin EOF and finishes, then keep
+            // draining remote -> stdout until it closes (issue #18).
             if (!f.remote_eof) {
-                f.remote_eof = true;
-                self.fwdTeardown(f);
+                f.wr_shutdown_pending = true;
+                self.fwdShutdownWrite();
             }
-            return; // no conns exist in this mode; isDone() short-circuits
+            return; // no conns exist in this mode; isDone() handles the rest
         }
         if (self.leg_conn) |c| {
             c.close();
@@ -2533,6 +2607,12 @@ pub fn main() !void {
         }
     }
     const u = url orelse usage();
+    // Logging gates must be live before ANY mode runs: forward mode
+    // returns below without ever reaching the HTTP path, so setting
+    // these after that branch left --verbose/--silent/--debug inert
+    // for stdio+tcp:// and stdio+ssh:// (issue #18).
+    ulog.verbose = cfg.verbose;
+    ulog.silent = cfg.silent;
     if (stdiofwd.parse(alloc, u, extra_positional.items) catch {
         log.err("invalid stdio target '{s}'", .{u});
         usage();
@@ -2556,8 +2636,6 @@ pub fn main() !void {
     if (extra_positional.items.len > 0) usage(); // extra args are stdio+ssh-only
     cfg.target = parseUrl(u) catch usage();
     cfg.url = u;
-    ulog.verbose = cfg.verbose;
-    ulog.silent = cfg.silent;
     if (cfg.enable_proxy) proxy.initFromEnv(alloc);
 
     // Config file (flags override file values)
