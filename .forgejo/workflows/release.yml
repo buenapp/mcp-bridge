@@ -214,59 +214,79 @@ jobs:
           PRERELEASE=false
           case "$VERSION" in *-rc*|*-alpha*|*-beta*) PRERELEASE=true ;; esac
 
-          # Delete existing release for this tag if present
-          RESP=$(curl -s -H "$AUTH" "$BASE_URL/releases/tags/$TAG")
-          EXISTING_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*' || true)
-          if [ -n "$EXISTING_ID" ]; then
-            curl -s -X DELETE -H "$AUTH" "$BASE_URL/releases/$EXISTING_ID"
-            echo "Deleted existing release $EXISTING_ID"
+          # Release notes precedence:
+          #   1. docs/release-notes/<tag>.md  — version-controlled, so notes
+          #      are reviewed in the PR that adds them and survive a re-run
+          #   2. an existing release's own body — left untouched, never
+          #      clobbered by the generic template below
+          #   3. the generic template — new releases with no notes file only
+          NOTES_FILE="docs/release-notes/${TAG}.md"
+          TEMPLATE="## MCP Bridge $TAG
+
+          Commit: $GITHUB_SHA
+
+          ### Downloads
+          - **mcp-bridge-${VERSION}-setup.exe** — Windows installer (system-wide or current-user, your choice)
+          - **mcp-bridge-${VERSION}.exe** — standalone Windows binary
+          - **mcp-bridge-${VERSION}-x86_64-freebsd** — FreeBSD binary (base OpenSSL, certctl trust)
+          - **mcp-bridge-${VERSION}-x86_64-linux** — Linux binary (glibc, distro OpenSSL 3)
+
+          Windows assets are Authenticode-signed."
+
+          # Reuse the release for this tag if it already exists. Recreating it
+          # would discard curated notes, asset download counts and the release
+          # id that anything already linking here depends on.
+          RELEASE_ID=$(curl -s -H "$AUTH" "$BASE_URL/releases/tags/$TAG" | jq -r '.id // empty')
+
+          if [ -n "$RELEASE_ID" ]; then
+            echo "Reusing existing release $RELEASE_ID"
+            if [ -f "$NOTES_FILE" ]; then
+              jq -Rs --argjson pre "$PRERELEASE" '{body: ., prerelease: $pre}' < "$NOTES_FILE" > /tmp/relbody.json
+              curl -s -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                --data-binary @/tmp/relbody.json "$BASE_URL/releases/$RELEASE_ID" > /dev/null
+              echo "Updated release body from $NOTES_FILE"
+            else
+              echo "No $NOTES_FILE — leaving the existing release body as-is"
+            fi
+          else
+            if [ -f "$NOTES_FILE" ]; then
+              BODY=$(cat "$NOTES_FILE")
+              echo "Creating release from $NOTES_FILE"
+            else
+              BODY="$TEMPLATE"
+              echo "Creating release from the generic template"
+            fi
+            jq -n --arg tag "$TAG" --arg body "$BODY" --argjson pre "$PRERELEASE" \
+              '{tag_name: $tag, name: $tag, body: $body, draft: false, prerelease: $pre}' > /tmp/relnew.json
+            RELEASE_ID=$(curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+              --data-binary @/tmp/relnew.json "$BASE_URL/releases" | jq -r '.id // empty')
+            if [ -z "$RELEASE_ID" ]; then
+              echo "ERROR: Failed to create release"
+              exit 1
+            fi
+            echo "Created release $RELEASE_ID"
           fi
 
-          # Create release
-          RESP=$(curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
-            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"## MCP Bridge $TAG\\n\\nCommit: $GITHUB_SHA\\n\\n### Downloads\\n- **mcp-bridge-${VERSION}-setup.exe** — Windows installer (system-wide or current-user, your choice)\\n- **mcp-bridge-${VERSION}.exe** — standalone Windows binary\\n- **mcp-bridge-${VERSION}-x86_64-freebsd** — FreeBSD binary (base OpenSSL, certctl trust)\\n- **mcp-bridge-${VERSION}-x86_64-linux** — Linux binary (glibc, distro OpenSSL 3)\\n\\nWindows assets are Authenticode-signed.\",\"draft\":false,\"prerelease\":$PRERELEASE}" \
-            "$BASE_URL/releases")
-          echo "Create release response: $RESP"
-          RELEASE_ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
-          if [ -z "$RELEASE_ID" ]; then
-            echo "ERROR: Failed to create release"
-            exit 1
-          fi
-          echo "Created release $RELEASE_ID"
+          # Replace an asset of the same name rather than adding a duplicate,
+          # so re-running the workflow for a tag is idempotent.
+          upload_asset() {
+            _path="$1"; _name="$2"
+            _old=$(curl -s -H "$AUTH" "$BASE_URL/releases/$RELEASE_ID/assets" \
+              | jq -r --arg n "$_name" '.[]? | select(.name == $n) | .id' | head -1)
+            if [ -n "$_old" ]; then
+              curl -s -X DELETE -H "$AUTH" "$BASE_URL/releases/$RELEASE_ID/assets/$_old" > /dev/null
+              echo "  replaced $_name"
+            fi
+            curl -s -X POST -H "$AUTH" -H "Content-Type: application/octet-stream" \
+              --data-binary "@$_path" "$BASE_URL/releases/$RELEASE_ID/assets?name=$_name" > /dev/null
+            echo "  uploaded $_name"
+          }
 
-          # Upload installer
-          curl -s -X POST -H "$AUTH" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary "@mcp-bridge-${VERSION}-setup.exe" \
-            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-setup.exe"
-          echo "Uploaded installer"
-
-          # Upload standalone binary
-          curl -s -X POST -H "$AUTH" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @zig-out/bin/mcp-bridge.exe \
-            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}.exe"
-          echo "Uploaded standalone binary"
-
-          # Upload FreeBSD + Linux binaries
-          curl -s -X POST -H "$AUTH" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @dist-freebsd/bin/mcp-bridge \
-            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-x86_64-freebsd"
-          echo "Uploaded FreeBSD binary"
-          curl -s -X POST -H "$AUTH" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @dist-linux/bin/mcp-bridge \
-            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-x86_64-linux"
-          echo "Uploaded Linux binary"
-
-          # Upload FreeBSD package
-          PKGF=$(ls dist-pkg/mcp-bridge-*.pkg | head -1)
-          curl -s -X POST -H "$AUTH" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary "@$PKGF" \
-            "$BASE_URL/releases/$RELEASE_ID/assets?name=mcp-bridge-${VERSION}-x86_64-freebsd.pkg"
-          echo "Uploaded FreeBSD package"
+          upload_asset "mcp-bridge-${VERSION}-setup.exe" "mcp-bridge-${VERSION}-setup.exe"
+          upload_asset zig-out/bin/mcp-bridge.exe        "mcp-bridge-${VERSION}.exe"
+          upload_asset dist-freebsd/bin/mcp-bridge       "mcp-bridge-${VERSION}-x86_64-freebsd"
+          upload_asset dist-linux/bin/mcp-bridge         "mcp-bridge-${VERSION}-x86_64-linux"
+          upload_asset "$(ls dist-pkg/mcp-bridge-*.pkg | head -1)" "mcp-bridge-${VERSION}-x86_64-freebsd.pkg"
 
   # --- Native Linux build + .deb + .rpm on the Ubuntu runner ---
   # (zig deadlocks under the FreeBSD Linuxulator, so Linux builds run
@@ -336,7 +356,7 @@ jobs:
           echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz" | sha256sum -c -
           $SUDO tar -xf /tmp/zig.tar.xz -C /opt
           $SUDO ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
-          $SUDO apt-get install -y -qq libssl-dev rpm dpkg
+          $SUDO apt-get install -y -qq libssl-dev rpm dpkg jq
           zig version
 
       - name: Unit tests
@@ -468,6 +488,13 @@ jobs:
 
           RPMF=$(ls mcp-bridge-${VERSION}-*.rpm | head -1)
           for f in "mcp-bridge_${VERSION}_amd64.deb" "$RPMF"; do
+            # Replace a same-named asset so re-runs stay idempotent.
+            OLD=$(curl -s -H "$AUTH" "$BASE_URL/releases/$RELEASE_ID/assets" \
+              | jq -r --arg n "$f" '.[]? | select(.name == $n) | .id' | head -1)
+            if [ -n "$OLD" ]; then
+              curl -s -X DELETE -H "$AUTH" "$BASE_URL/releases/$RELEASE_ID/assets/$OLD" > /dev/null
+              echo "Replaced $f"
+            fi
             curl -s -X POST -H "$AUTH" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@$f" \
