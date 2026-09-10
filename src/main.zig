@@ -374,8 +374,8 @@ pub const Bridge = struct {
         /// Set when the remote end died while the IDE session was live:
         /// surfaced as the bridge's exit status.
         exit_status: u8 = 0,
-        // Windows: ssh child pipes are anonymous (no overlapped I/O), so
-        // they get the same reader/writer relay treatment as IDE stdio.
+        // Windows: relay threads bridge the ssh child's pipes to the loop,
+        // the same pattern as the IDE stdio relays.
         relay_in: StdinRelay = .{}, // child stdout → loop mailbox
         relay_out: StdoutRelay = .{}, // loop → child stdin queue
         /// Windows: write end of the OVERLAPPED pipe serving as the ssh
@@ -638,32 +638,16 @@ pub const Bridge = struct {
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit; // ssh's diagnostics reach the IDE log
         if (platform.is_windows) {
-            // Child offers no way to supply a stdin handle, and the one it
-            // makes is unreadable to ssh (issue #23). `.Inherit` makes it
-            // take STD_INPUT_HANDLE, so swap ours in across the spawn and
-            // put it straight back. Safe here: attachStdio() already ran and
-            // the stdin relay captured the real handle by value, so nothing
-            // else reads this slot.
+            // Child cannot be handed a stdin handle, and its own synchronous
+            // stdin pipe is one Win32-OpenSSH never reads. `.Inherit` makes
+            // Child pass STD_INPUT_HANDLE, so swap our overlapped pipe in
+            // across the spawn and restore it. Safe: attachStdio() already
+            // captured the real handle by value. stdout stays Child's .Pipe.
             const w = std.os.windows;
             const win_mod = @import("win.zig");
-            // Both directions need a handle Child cannot supply: an
-            // overlapped pipe for stdin, an overlapped socket for stdout
-            // (issue #23). `.Inherit` makes Child pass whatever the std
-            // handle slot holds, so swap ours in across the spawn and put
-            // them straight back. Safe here: attachStdio() already ran and
-            // both relays captured the real handles by value, so nothing
-            // else reads these slots.
-            // Both clients get Child's .Pipe stdout. An earlier attempt
-            // handed OpenSSH an overlapped loopback socket instead; that was
-            // built on a measurement taken inside a Win32-OpenSSH sshd
-            // session, which is not how the bridge actually runs. In a
-            // desktop session ssh.exe relays a pipe correctly and delivers
-            // 0 bytes to an overlapped socket, so the socket was a
-            // regression (issue #23).
             const in_pipe = try winMakeStdinPipe();
             const saved_in = win_mod.GetStdHandle(w.STD_INPUT_HANDLE);
             child.stdin_behavior = .Inherit;
-            child.stdout_behavior = .Pipe;
             _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, in_pipe.rd);
             const restore = struct {
                 fn call(m: anytype, ww: anytype, si: ?std.os.windows.HANDLE) void {
@@ -687,8 +671,7 @@ pub const Bridge = struct {
         }
         f.child = child;
         if (platform.is_windows) {
-            // Anonymous pipes: reader/writer relay threads (same pattern as
-            // the IDE stdio relays above).
+            // Relay threads carry the child's pipes into the loop's IOCP.
             f.relay_in.thread = std.Thread.spawn(.{}, fwdReaderMain, .{self}) catch return error.SpawnFailed;
             const win = @import("win.zig");
             f.relay_out.event = win.CreateEventExW(null, null, 0, 0x1F0003) orelse return error.SpawnFailed;
@@ -955,7 +938,7 @@ pub const Bridge = struct {
         }
     }
 
-    /// Windows: child stdout reader relay — blocking ReadFile → mailbox +
+    /// Windows: child stdout reader relay — overlapped ReadFile → mailbox +
     /// completion post into the loop's IOCP. Dies with the process on exit.
     fn fwdReaderMain(self: *Bridge) void {
         const win = @import("win.zig");
@@ -1004,21 +987,18 @@ pub const Bridge = struct {
         const r = &f.relay_out;
         while (true) {
             _ = std.os.windows.WaitForSingleObject(r.event.?, win.INFINITE) catch {};
-            // Drain to empty before waiting again. The event is auto-reset,
+            // Drain to empty before waiting again: the event is auto-reset,
             // so a queue append and a quit set back-to-back collapse into a
-            // SINGLE wake; the old code handled one chunk per wake and then
-            // blocked forever, never closing the child's stdin (issue #23).
+            // single wake.
             while (true) {
                 r.mutex.lock();
                 if (r.queue.items.len == 0) {
                     const done = r.quit;
                     r.mutex.unlock();
                     if (done) {
-                        // Named pipes discard bytes the reader has not
-                        // consumed when the writing handle closes, so the
-                        // remote saw EOF partway through the batch and shut
-                        // down mid-handshake. Block until the child has
-                        // taken everything, THEN signal EOF (issue #23).
+                        // A named pipe discards unread bytes when its write
+                        // handle closes, so flush until the child has taken
+                        // everything before signalling EOF.
                         ulog.vprint("DIAG fwd-wr: quit, flushing child stdin\n", .{});
                         _ = win.FlushFileBuffers(h);
                         _ = win.CloseHandle(h);
