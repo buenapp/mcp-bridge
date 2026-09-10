@@ -40,6 +40,16 @@ pub extern "kernel32" fn WriteFile(
     lpOverlapped: ?*anyopaque,
 ) BOOL;
 pub extern "kernel32" fn GetLastError() DWORD;
+pub extern "kernel32" fn GetOverlappedResult(
+    hFile: HANDLE,
+    lpOverlapped: *anyopaque,
+    lpNumberOfBytesTransferred: *DWORD,
+    bWait: BOOL,
+) BOOL;
+
+pub const ERROR_IO_PENDING: DWORD = 997;
+pub const ERROR_BROKEN_PIPE: DWORD = 109;
+pub const CREATE_EVENT_MANUAL_RESET: DWORD = 0x00000001;
 
 // ------------------------------------------------------- IOCP / events --
 

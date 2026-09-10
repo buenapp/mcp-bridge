@@ -369,10 +369,10 @@ pub const Bridge = struct {
         /// handed a pre-made handle, and its own synchronous stdin pipe is
         /// one Win32-OpenSSH never reads (issue #23).
         win_stdin_wr: ?@import("win.zig").HANDLE = null,
-        /// Windows: read end of the SYNCHRONOUS pipe carrying the child's
-        /// stdout. Child builds that pipe with FILE_FLAG_OVERLAPPED, and a
-        /// blocking ReadFile with a null OVERLAPPED on such a handle is
-        /// undefined — it completed once and then wedged (issue #23).
+        /// Windows: read end of the child's stdout pipe, which Child builds
+        /// with FILE_FLAG_OVERLAPPED. fwdReaderMain must therefore read it
+        /// with a real OVERLAPPED; a blocking ReadFile with a null OVERLAPPED
+        /// on such a handle is undefined (issue #23).
         win_stdout_rd: ?@import("win.zig").HANDLE = null,
     };
 
@@ -466,11 +466,13 @@ pub const Bridge = struct {
             while (off < chunk.len) {
                 var n: u32 = 0;
                 if (win.WriteFile(h, chunk.ptr + off, @intCast(chunk.len - off), &n, null) == 0) {
+                    ulog.vprint("DIAG out-wr: WriteFile failed gle={d} at off={d}/{d}\n", .{ win.GetLastError(), off, chunk.len });
                     failed = true;
                     break;
                 }
                 off += n;
             }
+            ulog.vprint("DIAG out-wr: wrote {d}/{d} to IDE stdout\n", .{ off, chunk.len });
             self.alloc.free(chunk);
             if (failed) {
                 r.mutex.lock();
@@ -573,6 +575,12 @@ pub const Bridge = struct {
             .lpSecurityDescriptor = null,
             .bInheritHandle = w.TRUE,
         };
+        var sa_private = w.SECURITY_ATTRIBUTES{
+            .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = null,
+            .bInheritHandle = w.FALSE,
+        };
+
         const rd = w.kernel32.CreateNamedPipeW(
             name.ptr,
             w.PIPE_ACCESS_INBOUND | w.FILE_FLAG_OVERLAPPED,
@@ -586,11 +594,6 @@ pub const Bridge = struct {
         if (rd == w.INVALID_HANDLE_VALUE) return error.SpawnFailed;
         errdefer w.CloseHandle(rd);
 
-        var sa_private = w.SECURITY_ATTRIBUTES{
-            .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
-            .lpSecurityDescriptor = null,
-            .bInheritHandle = w.FALSE,
-        };
         const wr = w.kernel32.CreateFileW(
             name.ptr,
             w.GENERIC_WRITE,
@@ -601,29 +604,6 @@ pub const Bridge = struct {
             null,
         );
         if (wr == w.INVALID_HANDLE_VALUE) return error.SpawnFailed;
-        return .{ .rd = rd, .wr = wr };
-    }
-
-    /// Windows: the pipe carrying the ssh child's stdout. Deliberately a
-    /// plain synchronous pipe: the relay reads it with a blocking ReadFile,
-    /// which is only valid on a handle NOT opened FILE_FLAG_OVERLAPPED.
-    /// Returns .{ rd, wr } — rd is ours, wr is the child's.
-    fn winMakeStdoutPipe() !struct { rd: std.os.windows.HANDLE, wr: std.os.windows.HANDLE } {
-        const w = std.os.windows;
-        var sa = w.SECURITY_ATTRIBUTES{
-            .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
-            .lpSecurityDescriptor = null,
-            .bInheritHandle = w.TRUE,
-        };
-        var rd: w.HANDLE = undefined;
-        var wr: w.HANDLE = undefined;
-        w.CreatePipe(&rd, &wr, &sa) catch return error.SpawnFailed;
-        errdefer {
-            w.CloseHandle(rd);
-            w.CloseHandle(wr);
-        }
-        // Our read end stays private; only the child's write end is inherited.
-        w.SetHandleInformation(rd, w.HANDLE_FLAG_INHERIT, 0) catch return error.SpawnFailed;
         return .{ .rd = rd, .wr = wr };
     }
 
@@ -644,34 +624,34 @@ pub const Bridge = struct {
             // else reads this slot.
             const w = std.os.windows;
             const win_mod = @import("win.zig");
+            // stdout stays `.Pipe`: Child hands the ssh process its stdout
+            // through STARTUPINFO, which is the arrangement Win32-OpenSSH
+            // relays cleanly. Handing it one via SetStdHandle/.Inherit
+            // instead left ssh wedged after its first chunk (issue #23).
+            // Only stdin needs the swap, because Child offers no way to
+            // supply a stdin handle and the one it makes is unreadable to
+            // ssh.
             const in_pipe = try winMakeStdinPipe();
-            const out_pipe = try winMakeStdoutPipe();
             const saved_in = win_mod.GetStdHandle(w.STD_INPUT_HANDLE);
-            const saved_out = win_mod.GetStdHandle(w.STD_OUTPUT_HANDLE);
             child.stdin_behavior = .Inherit;
-            child.stdout_behavior = .Inherit;
+            child.stdout_behavior = .Pipe;
             _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, in_pipe.rd);
-            _ = win_mod.SetStdHandle(w.STD_OUTPUT_HANDLE, out_pipe.wr);
             const restore = struct {
-                fn call(m: anytype, ww: anytype, si: ?std.os.windows.HANDLE, so: ?std.os.windows.HANDLE) void {
+                fn call(m: anytype, ww: anytype, si: ?std.os.windows.HANDLE) void {
                     if (si) |h| _ = m.SetStdHandle(ww.STD_INPUT_HANDLE, h);
-                    if (so) |h| _ = m.SetStdHandle(ww.STD_OUTPUT_HANDLE, h);
                 }
             }.call;
             child.spawn() catch |err| {
-                restore(win_mod, w, saved_in, saved_out);
+                restore(win_mod, w, saved_in);
                 w.CloseHandle(in_pipe.rd);
                 w.CloseHandle(in_pipe.wr);
-                w.CloseHandle(out_pipe.rd);
-                w.CloseHandle(out_pipe.wr);
                 return err;
             };
-            restore(win_mod, w, saved_in, saved_out);
-            // The child holds its own inherited copies now.
+            restore(win_mod, w, saved_in);
+            // The child holds its own inherited copy now.
             w.CloseHandle(in_pipe.rd);
-            w.CloseHandle(out_pipe.wr);
             f.win_stdin_wr = in_pipe.wr;
-            f.win_stdout_rd = out_pipe.rd;
+            f.win_stdout_rd = child.stdout.?.handle;
         } else {
             child.stdin_behavior = .Pipe;
             try child.spawn();
@@ -874,6 +854,7 @@ pub const Bridge = struct {
     fn fwdRemoteClosed(self: *Bridge, why: ?[]const u8) void {
         const f = &self.fwd.?;
         if (f.remote_eof) return;
+        ulog.vprint("DIAG fwdRemoteClosed: why={s} carry={d} stdin_eof={}\n", .{ why orelse "(eof)", f.carry.items.len, self.stdin_eof });
         f.remote_eof = true;
         if (f.carry.items.len > 0) {
             var line = f.carry.items;
@@ -951,14 +932,30 @@ pub const Bridge = struct {
         const win = @import("win.zig");
         const f = &self.fwd.?;
         const h: win.HANDLE = f.win_stdout_rd orelse return;
+        // The handle is FILE_FLAG_OVERLAPPED: every read needs a real
+        // OVERLAPPED plus an event to wait on (issue #23).
+        const ev = win.CreateEventExW(null, null, win.CREATE_EVENT_MANUAL_RESET, 0x1F0003) orelse return;
+        defer _ = win.CloseHandle(ev);
         var tmp: [4096]u8 = undefined;
+        var calls: usize = 0;
+        var total: usize = 0;
         while (true) {
             var n: u32 = 0;
-            const ok = win.ReadFile(h, &tmp, tmp.len, &n, null);
+            calls += 1;
+            var ov = std.mem.zeroes(std.os.windows.OVERLAPPED);
+            ov.hEvent = ev;
+            var ok = win.ReadFile(h, &tmp, tmp.len, &n, &ov);
+            if (ok == 0 and win.GetLastError() == win.ERROR_IO_PENDING)
+                ok = win.GetOverlappedResult(h, &ov, &n, 1);
+            const gle: u32 = if (ok == 0) win.GetLastError() else 0;
+            total += n;
+            ulog.vprint("DIAG fwd-rd: call={d} ok={d} n={d} gle={d} total={d}\n", .{ calls, ok, n, gle, total });
             f.relay_in.mutex.lock();
             if (ok == 0 or n == 0) {
                 f.relay_in.eof = true;
+                const pend = f.relay_in.buf.items.len;
                 f.relay_in.mutex.unlock();
+                ulog.vprint("DIAG fwd-rd: EOF after {d} calls, {d} bytes; mailbox pending={d}\n", .{ calls, total, pend });
                 self.evp.post(@as(*anyopaque, @constCast(&remote_sentinel)), null, 0);
                 return;
             }
@@ -993,8 +990,10 @@ pub const Bridge = struct {
                         // remote saw EOF partway through the batch and shut
                         // down mid-handshake. Block until the child has
                         // taken everything, THEN signal EOF (issue #23).
+                        ulog.vprint("DIAG fwd-wr: quit, flushing child stdin\n", .{});
                         _ = win.FlushFileBuffers(h);
                         _ = win.CloseHandle(h);
+                        ulog.vprint("DIAG fwd-wr: child stdin closed\n", .{});
                         return;
                     }
                     break; // nothing staged: wait for the next signal
@@ -1008,9 +1007,13 @@ pub const Bridge = struct {
                 while (off < chunk.len) {
                     var n: u32 = 0;
                     const wok = win.WriteFile(h, chunk.ptr + off, @intCast(chunk.len - off), &n, null);
-                    if (wok == 0) break;
+                    if (wok == 0) {
+                        ulog.vprint("DIAG fwd-wr: WriteFile failed gle={d} at off={d}/{d}\n", .{ win.GetLastError(), off, chunk.len });
+                        break;
+                    }
                     off += n;
                 }
+                ulog.vprint("DIAG fwd-wr: wrote {d}/{d} to child stdin\n", .{ off, chunk.len });
                 self.alloc.free(chunk);
             }
         }
@@ -1027,6 +1030,7 @@ pub const Bridge = struct {
             r.buf.clearRetainingCapacity();
         }
         r.mutex.unlock();
+        ulog.vprint("DIAG fwd-ev: eof={} carry={d} remote_eof={}\n", .{ eof, f.carry.items.len, f.remote_eof });
         self.fwdSplitServerLines();
         if (eof and !f.remote_eof) self.fwdRemoteClosed(null);
     }
@@ -1057,7 +1061,10 @@ pub const Bridge = struct {
             const r = &self.stdout_relay;
             r.mutex.lock();
             if (!r.dead) r.queue.appendSlice(self.alloc, bytes) catch {};
+            const qlen = r.queue.items.len;
+            const dead = r.dead;
             r.mutex.unlock();
+            ulog.vprint("DIAG out-q: staged {d} bytes, queue={d}, dead={}\n", .{ bytes.len, qlen, dead });
             if (r.event) |ev| _ = @import("win.zig").SetEvent(ev);
             return;
         }
@@ -1246,12 +1253,25 @@ pub const Bridge = struct {
             // The remote still owes replies to whatever was in flight when
             // stdin ended; we are done only once it closes its own end and
             // everything it sent has reached stdout (issue #18).
+            const drained = self.stdoutDrained();
+            ulog.vprint("DIAG isDone: remote_eof={} stdoutDrained={} outq={d}\n", .{ f.remote_eof, drained, self.stdoutQueueLen() });
             if (!f.remote_eof) return false;
-            return self.stdoutDrained();
+            return drained;
         }
         if (self.conns.items.len != 0) return false;
         if (!self.stdoutDrained()) return false;
         return true;
+    }
+
+    /// Diagnostics only: bytes still staged for stdout.
+    fn stdoutQueueLen(self: *Bridge) usize {
+        if (platform.is_windows) {
+            const r = &self.stdout_relay;
+            r.mutex.lock();
+            defer r.mutex.unlock();
+            return r.queue.items.len;
+        }
+        return self.stdout_q.items.len;
     }
 
     fn stdoutDrained(self: *Bridge) bool {
@@ -2630,8 +2650,14 @@ fn runForward(alloc: std.mem.Allocator, cfg: *const Config, ft: stdiofwd.Target)
         std.process.exit(1);
     };
     ulog.vprint("mcp-bridge: event loop starting\n", .{});
-    try bridge.run();
+    bridge.run() catch |err| {
+        ulog.vprint("DIAG runForward: run() FAILED: {s}\n", .{@errorName(err)});
+        bridge.shutdownStdio();
+        return err;
+    };
+    ulog.vprint("DIAG runForward: run() returned cleanly\n", .{});
     bridge.shutdownStdio();
+    ulog.vprint("DIAG runForward: shutdownStdio done, exiting {d}\n", .{bridge.fwd.?.exit_status});
     std.process.exit(bridge.fwd.?.exit_status);
 }
 
