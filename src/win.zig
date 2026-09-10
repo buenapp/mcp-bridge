@@ -68,6 +68,8 @@ pub extern "kernel32" fn CreateEventExW(
 pub extern "kernel32" fn SetEvent(hEvent: HANDLE) BOOL;
 pub extern "kernel32" fn CloseHandle(hObject: HANDLE) BOOL;
 pub extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) BOOL;
+pub extern "kernel32" fn SetHandleInformation(hObject: HANDLE, dwMask: DWORD, dwFlags: DWORD) BOOL;
+pub const HANDLE_FLAG_INHERIT: DWORD = 0x00000001;
 
 // --------------------------------------------------------------- winsock --
 

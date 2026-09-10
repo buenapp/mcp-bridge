@@ -369,10 +369,10 @@ pub const Bridge = struct {
         /// handed a pre-made handle, and its own synchronous stdin pipe is
         /// one Win32-OpenSSH never reads (issue #23).
         win_stdin_wr: ?@import("win.zig").HANDLE = null,
-        /// Windows: read end of the child's stdout pipe, which Child builds
-        /// with FILE_FLAG_OVERLAPPED. fwdReaderMain must therefore read it
-        /// with a real OVERLAPPED; a blocking ReadFile with a null OVERLAPPED
-        /// on such a handle is undefined (issue #23).
+        /// Windows: our end of the loopback socket serving as the ssh
+        /// child's stdout (winMakeStdoutSocket). Overlapped, so fwdReaderMain
+        /// must read it with a real OVERLAPPED; a blocking ReadFile with a
+        /// null OVERLAPPED on such a handle is undefined (issue #23).
         win_stdout_rd: ?@import("win.zig").HANDLE = null,
     };
 
@@ -607,6 +607,76 @@ pub const Bridge = struct {
         return .{ .rd = rd, .wr = wr };
     }
 
+    /// Windows: build the loopback socket pair that becomes the ssh child's
+    /// stdout.
+    ///
+    /// Win32-OpenSSH relays only its first burst and then wedges forever —
+    /// it neither relays more nor exits — whenever its stdout is a pipe.
+    /// Reproduced with no bridge involved, on both installed builds, for
+    /// every pipe shape (anonymous synchronous, named overlapped, and
+    /// Child's own). Its compat layer is WinSock-native, so a socket avoids
+    /// the pipe readiness path entirely: ssh then relays everything and
+    /// exits rc=0 (issue #23).
+    ///
+    /// The child's end MUST carry WSA_FLAG_OVERLAPPED, which an accepted
+    /// socket inherits from its listener. Measured: a non-overlapped socket
+    /// wedges exactly like a pipe, so the listener's flag is the whole fix.
+    ///
+    /// Returns .{ .child, .parent } — child is inheritable, parent is ours.
+    fn winMakeStdoutSocket() !struct { child: std.os.windows.HANDLE, parent: std.os.windows.HANDLE } {
+        const w = std.os.windows;
+        const ws2 = w.ws2_32;
+        const win_mod = @import("win.zig");
+
+        // WinSock is otherwise only started by the OAuth loopback listener,
+        // which this path never touches. WSAStartup is refcounted, so calling
+        // it again here is harmless.
+        var wsa: ws2.WSADATA = undefined;
+        _ = ws2.WSAStartup(0x0202, &wsa);
+
+        const listener = ws2.WSASocketW(ws2.AF.INET, ws2.SOCK.STREAM, ws2.IPPROTO.TCP, null, 0, ws2.WSA_FLAG_OVERLAPPED);
+        if (listener == ws2.INVALID_SOCKET) {
+            ulog.vprint("DIAG fwd-sock: listener WSASocketW failed wsa={d}\n", .{@intFromEnum(ws2.WSAGetLastError())});
+            return error.SpawnFailed;
+        }
+        defer _ = ws2.closesocket(listener);
+        _ = win_mod.SetHandleInformation(@ptrCast(listener), win_mod.HANDLE_FLAG_INHERIT, 0);
+
+        var addr = ws2.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        if (ws2.bind(listener, @ptrCast(&addr), @sizeOf(ws2.sockaddr.in)) != 0) {
+            ulog.vprint("DIAG fwd-sock: bind failed wsa={d}\n", .{@intFromEnum(ws2.WSAGetLastError())});
+            return error.SpawnFailed;
+        }
+        if (ws2.listen(listener, 1) != 0) {
+            ulog.vprint("DIAG fwd-sock: listen failed wsa={d}\n", .{@intFromEnum(ws2.WSAGetLastError())});
+            return error.SpawnFailed;
+        }
+        var bound: ws2.sockaddr.in = undefined;
+        var blen: i32 = @sizeOf(ws2.sockaddr.in);
+        if (ws2.getsockname(listener, @ptrCast(&bound), &blen) != 0) return error.SpawnFailed;
+
+        const parent = ws2.WSASocketW(ws2.AF.INET, ws2.SOCK.STREAM, ws2.IPPROTO.TCP, null, 0, ws2.WSA_FLAG_OVERLAPPED);
+        if (parent == ws2.INVALID_SOCKET) return error.SpawnFailed;
+        errdefer _ = ws2.closesocket(parent);
+        _ = win_mod.SetHandleInformation(@ptrCast(parent), win_mod.HANDLE_FLAG_INHERIT, 0);
+        if (ws2.connect(parent, @ptrCast(&bound), @sizeOf(ws2.sockaddr.in)) != 0) {
+            ulog.vprint("DIAG fwd-sock: connect failed wsa={d}\n", .{@intFromEnum(ws2.WSAGetLastError())});
+            return error.SpawnFailed;
+        }
+
+        const child = ws2.accept(listener, null, null);
+        if (child == ws2.INVALID_SOCKET) {
+            ulog.vprint("DIAG fwd-sock: accept failed wsa={d}\n", .{@intFromEnum(ws2.WSAGetLastError())});
+            return error.SpawnFailed;
+        }
+        errdefer _ = ws2.closesocket(child);
+        if (win_mod.SetHandleInformation(@ptrCast(child), win_mod.HANDLE_FLAG_INHERIT, win_mod.HANDLE_FLAG_INHERIT) == 0)
+            return error.SpawnFailed;
+
+        ulog.vprint("DIAG fwd-sock: loopback pair ready (overlapped child end)\n", .{});
+        return .{ .child = @ptrCast(child), .parent = @ptrCast(parent) };
+    }
+
     fn fwdStartSsh(self: *Bridge, s: *const stdiofwd.Ssh) !void {
         const f = &self.fwd.?;
         const argv = try s.sshArgv(self.alloc);
@@ -624,34 +694,42 @@ pub const Bridge = struct {
             // else reads this slot.
             const w = std.os.windows;
             const win_mod = @import("win.zig");
-            // stdout stays `.Pipe`: Child hands the ssh process its stdout
-            // through STARTUPINFO, which is the arrangement Win32-OpenSSH
-            // relays cleanly. Handing it one via SetStdHandle/.Inherit
-            // instead left ssh wedged after its first chunk (issue #23).
-            // Only stdin needs the swap, because Child offers no way to
-            // supply a stdin handle and the one it makes is unreadable to
-            // ssh.
+            // Both directions need a handle Child cannot supply: an
+            // overlapped pipe for stdin, an overlapped socket for stdout
+            // (issue #23). `.Inherit` makes Child pass whatever the std
+            // handle slot holds, so swap ours in across the spawn and put
+            // them straight back. Safe here: attachStdio() already ran and
+            // both relays captured the real handles by value, so nothing
+            // else reads these slots.
             const in_pipe = try winMakeStdinPipe();
+            const out_sock = try winMakeStdoutSocket();
             const saved_in = win_mod.GetStdHandle(w.STD_INPUT_HANDLE);
+            const saved_out = win_mod.GetStdHandle(w.STD_OUTPUT_HANDLE);
             child.stdin_behavior = .Inherit;
-            child.stdout_behavior = .Pipe;
+            child.stdout_behavior = .Inherit;
             _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, in_pipe.rd);
+            _ = win_mod.SetStdHandle(w.STD_OUTPUT_HANDLE, out_sock.child);
             const restore = struct {
-                fn call(m: anytype, ww: anytype, si: ?std.os.windows.HANDLE) void {
+                fn call(m: anytype, ww: anytype, si: ?std.os.windows.HANDLE, so: ?std.os.windows.HANDLE) void {
                     if (si) |h| _ = m.SetStdHandle(ww.STD_INPUT_HANDLE, h);
+                    if (so) |h| _ = m.SetStdHandle(ww.STD_OUTPUT_HANDLE, h);
                 }
             }.call;
             child.spawn() catch |err| {
-                restore(win_mod, w, saved_in);
+                restore(win_mod, w, saved_in, saved_out);
                 w.CloseHandle(in_pipe.rd);
                 w.CloseHandle(in_pipe.wr);
+                _ = w.ws2_32.closesocket(@ptrCast(out_sock.child));
+                _ = w.ws2_32.closesocket(@ptrCast(out_sock.parent));
                 return err;
             };
-            restore(win_mod, w, saved_in);
-            // The child holds its own inherited copy now.
+            restore(win_mod, w, saved_in, saved_out);
+            // The child holds its own inherited copies now. Dropping ours is
+            // what lets the read side ever see EOF.
             w.CloseHandle(in_pipe.rd);
+            _ = w.ws2_32.closesocket(@ptrCast(out_sock.child));
             f.win_stdin_wr = in_pipe.wr;
-            f.win_stdout_rd = child.stdout.?.handle;
+            f.win_stdout_rd = out_sock.parent;
         } else {
             child.stdin_behavior = .Pipe;
             try child.spawn();
@@ -892,10 +970,11 @@ pub const Bridge = struct {
                     f.win_stdin_wr = null;
                 }
             }
-            // Closing our read end makes the reader's blocking ReadFile
-            // return, so the thread cannot outlive the bridge.
+            // Closing our read end makes the reader's pending overlapped
+            // read complete, so the thread cannot outlive the bridge. It is
+            // a socket, so it closes with closesocket.
             if (f.win_stdout_rd) |rh| {
-                _ = @import("win.zig").CloseHandle(rh);
+                _ = std.os.windows.ws2_32.closesocket(@ptrCast(rh));
                 f.win_stdout_rd = null;
             }
         } else {
