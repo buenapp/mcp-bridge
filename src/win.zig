@@ -24,6 +24,7 @@ pub const STD_OUTPUT_HANDLE: DWORD = @bitCast(@as(i32, -11));
 pub const STD_ERROR_HANDLE: DWORD = @bitCast(@as(i32, -12));
 
 pub extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) ?HANDLE;
+pub extern "kernel32" fn SetStdHandle(nStdHandle: DWORD, hHandle: HANDLE) BOOL;
 pub extern "kernel32" fn ReadFile(
     hFile: HANDLE,
     lpBuffer: [*]u8,
@@ -39,6 +40,16 @@ pub extern "kernel32" fn WriteFile(
     lpOverlapped: ?*anyopaque,
 ) BOOL;
 pub extern "kernel32" fn GetLastError() DWORD;
+pub extern "kernel32" fn GetOverlappedResult(
+    hFile: HANDLE,
+    lpOverlapped: *anyopaque,
+    lpNumberOfBytesTransferred: *DWORD,
+    bWait: BOOL,
+) BOOL;
+
+pub const ERROR_IO_PENDING: DWORD = 997;
+pub const ERROR_BROKEN_PIPE: DWORD = 109;
+pub const CREATE_EVENT_MANUAL_RESET: DWORD = 0x00000001;
 
 // ------------------------------------------------------- IOCP / events --
 
@@ -56,6 +67,10 @@ pub extern "kernel32" fn CreateEventExW(
 ) ?HANDLE;
 pub extern "kernel32" fn SetEvent(hEvent: HANDLE) BOOL;
 pub extern "kernel32" fn CloseHandle(hObject: HANDLE) BOOL;
+pub extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) BOOL;
+pub extern "kernel32" fn SetHandleInformation(hObject: HANDLE, dwMask: DWORD, dwFlags: DWORD) BOOL;
+pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *DWORD) BOOL;
+pub const HANDLE_FLAG_INHERIT: DWORD = 0x00000001;
 
 // --------------------------------------------------------------- winsock --
 

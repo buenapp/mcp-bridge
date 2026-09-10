@@ -210,14 +210,45 @@ mcp-bridge stdio+ssh://admin@host:2222/opt/bin/vnc-mcp-server --verbose
 The bridge runs your system `ssh` and does **not** pass `-F`, so your
 `~/.ssh/config` applies in full — host aliases, `User`, `IdentityFile`,
 `ProxyJump`, and everything below. That is the place to configure the
-ssh hop; there is no flag for it on the bridge (forward mode accepts only
-`--ignore-tool`, `--verbose`/`-v`, `--silent` and `--debug`).
+ssh hop. Forward mode otherwise accepts only `--ignore-tool`,
+`--verbose`/`-v`, `--silent`, `--debug` and the `--ssh-*` options below.
 
 The bridge sets three options on the command line, which therefore
 **override** anything you put in the config file for them: `-T` (no pty —
 a pty would echo and mangle the line protocol), `BatchMode=yes` (never
 hang an IDE waiting on a prompt) and `ConnectTimeout=10`. Everything else
 is yours.
+
+### Using PuTTY's plink instead of OpenSSH
+
+`--ssh-client plink` drives PuTTY's `plink` rather than `ssh`. OpenSSH is
+the default and is the better choice unless you already run a PuTTY
+setup, because plink comes with three hard prerequisites:
+
+- **It ignores `~/.ssh/config` completely.** Host aliases, `ProxyJump`,
+  `IdentityFile`, per-host ports — none of it applies. Everything must be
+  on the command line.
+- **It cannot read OpenSSH keys.** `plink -i` accepts only PuTTY's `.ppk`
+  format. Converting means opening `puttygen` and using *Load* then *Save
+  private key*: the Windows build of `puttygen` rejects the Unix
+  command-line conversion options, so there is no scripted path.
+- **`-batch` aborts on a host key it has not cached**, and PuTTY has no
+  `accept-new`. Either connect once interactively with `plink` to cache
+  the key, or pass the fingerprint with `--ssh-hostkey`.
+
+```console
+mcp-bridge --ssh-client plink \
+           --ssh-identity C:\keys\dev.ppk \
+           --ssh-hostkey SHA256:<the fingerprint plink prints on a first connection> \
+           stdio+ssh://admin@freebsd-dev1/opt/bin/vnc-mcp-server
+```
+
+`--ssh-identity` works for OpenSSH too, where it is passed as `-i` and
+takes any key format OpenSSH supports. `--ssh-hostkey` is plink-only;
+OpenSSH uses `known_hosts`.
+
+Both clients are driven identically by the bridge — only the command line
+differs.
 
 **Keepalive.** OpenSSH ships with `ServerAliveInterval 0`, i.e. off, and
 `TCPKeepAlive yes` does not probe until roughly two hours of idle on
