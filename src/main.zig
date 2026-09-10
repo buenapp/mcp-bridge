@@ -413,7 +413,15 @@ pub const Bridge = struct {
         }
         const stdin_h = win.GetStdHandle(win.STD_INPUT_HANDLE);
         if (stdin_h == null) return;
-        if (win.GetFileType(stdin_h.?) != win.FILE_TYPE_PIPE) return; // console: manual OAuth runs have no loop stdin
+        // Skip only a real CONSOLE: manual OAuth runs have no loop stdin,
+        // and reading the console would swallow the user's keystrokes.
+        // Every other shape must be read, or stdin never reaches EOF and
+        // the bridge hangs at 0 bytes (issue #23). Gating on FILE_TYPE is
+        // not enough in either direction: `< input.jsonl` is FILE_TYPE_DISK
+        // and `< NUL` is FILE_TYPE_CHAR just like a console, so ask whether
+        // the handle is a console directly.
+        var console_mode: @import("win.zig").DWORD = undefined;
+        if (win.GetConsoleMode(stdin_h.?, &console_mode) != 0) return;
         self.stdin_relay.handle = stdin_h.?;
         self.stdin_relay.thread = std.Thread.spawn(.{}, stdinReaderMain, .{self}) catch null;
         self.stdin_active = self.stdin_relay.thread != null;
