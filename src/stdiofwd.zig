@@ -26,12 +26,9 @@ pub const Target = union(enum) {
 
 /// Which local SSH client drives the connection.
 ///
-/// They are not interchangeable on Windows, and the difference reaches all
-/// the way into how the child's stdout must be created (issue #23):
-/// OpenSSH's ssh.exe wedges forever on a pipe and needs an OVERLAPPED
-/// loopback socket, while plink does a plain synchronous WriteFile and
-/// rejects an overlapped handle outright with ERROR_INVALID_PARAMETER, so
-/// it needs an ordinary pipe. See fwdStartSsh.
+/// Both are driven over ordinary pipes; only the argv differs. plink is
+/// opt-in because it ignores ~/.ssh/config, needs PuTTY-format keys, and
+/// aborts in batch mode on an uncached host key.
 pub const Client = enum { openssh, plink };
 
 pub const Ssh = struct {
