@@ -247,9 +247,8 @@ mcp-bridge --ssh-client plink \
 takes any key format OpenSSH supports. `--ssh-hostkey` is plink-only;
 OpenSSH uses `known_hosts`.
 
-Both clients are equally supported by the bridge, which adapts to each
-one's Windows quirks internally — see `docs/` and issue #23 if you are
-curious why the two need different plumbing.
+Both clients are driven identically by the bridge — only the command line
+differs.
 
 **Keepalive.** OpenSSH ships with `ServerAliveInterval 0`, i.e. off, and
 `TCPKeepAlive yes` does not probe until roughly two hours of idle on
