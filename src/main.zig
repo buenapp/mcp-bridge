@@ -116,6 +116,14 @@ pub const Config = struct {
     /// --host: OAuth callback hostname for the redirect URI (default
     /// "localhost"); the listener binds its first IPv4 resolution.
     callback_host: ?[]const u8 = null,
+    /// --ssh-client: which local SSH client drives stdio+ssh:// targets.
+    /// Default OpenSSH; plink is opt-in because it ignores ~/.ssh/config
+    /// and needs PuTTY-format keys.
+    ssh_client: @import("stdiofwd.zig").Client = .openssh,
+    /// --ssh-identity: private key file passed to the client.
+    ssh_identity: ?[]const u8 = null,
+    /// --ssh-hostkey: expected host key fingerprint (plink only).
+    ssh_hostkey: ?[]const u8 = null,
     /// --enable-proxy: honor http_proxy/https_proxy/no_proxy env vars
     /// (CONNECT tunnels for https, absolute-form for http).
     enable_proxy: bool = false,
@@ -167,6 +175,12 @@ fn usage() noreturn {
         \\                          (stderr of ssh goes to our stderr); remote args are
         \\                          appended to the remote command line
         \\  forward mode accepts only --ignore-tool / --verbose / --silent / --debug
+        \\                          and the --ssh-* options below
+        \\  --ssh-client C          openssh (default) | plink. plink is PuTTY's client:
+        \\                          it ignores ~/.ssh/config and needs a PuTTY .ppk key
+        \\  --ssh-identity PATH     private key file (-i); plink requires .ppk format
+        \\  --ssh-hostkey FP        expected host key fingerprint (plink only; plink
+        \\                          -batch aborts on an uncached host key)
         \\
     , .{});
     std.process.exit(2);
@@ -369,11 +383,15 @@ pub const Bridge = struct {
         /// handed a pre-made handle, and its own synchronous stdin pipe is
         /// one Win32-OpenSSH never reads (issue #23).
         win_stdin_wr: ?@import("win.zig").HANDLE = null,
-        /// Windows: our end of the loopback socket serving as the ssh
-        /// child's stdout (winMakeStdoutSocket). Overlapped, so fwdReaderMain
+        /// Windows: our end of the ssh child's stdout. For OpenSSH that is
+        /// the loopback socket from winMakeStdoutSocket; for plink it is
+        /// Child's own .Pipe. Either way it is overlapped, so fwdReaderMain
         /// must read it with a real OVERLAPPED; a blocking ReadFile with a
         /// null OVERLAPPED on such a handle is undefined (issue #23).
         win_stdout_rd: ?@import("win.zig").HANDLE = null,
+        /// Windows: whether win_stdout_rd is a socket (closesocket) or a
+        /// pipe handle (CloseHandle).
+        win_stdout_is_socket: bool = false,
     };
 
     /// Production: wire up stdin + stdout for the loop.
@@ -688,7 +706,7 @@ pub const Bridge = struct {
     fn fwdStartSsh(self: *Bridge, s: *const stdiofwd.Ssh) !void {
         const f = &self.fwd.?;
         const argv = try s.sshArgv(self.alloc);
-        ulog.vprint("mcp-bridge: forward ssh spawn: ssh ... {s}\n", .{argv[argv.len - 1]});
+        ulog.vprint("mcp-bridge: forward ssh spawn: {s} ... {s}\n", .{ argv[0], argv[argv.len - 1] });
         const child = try self.alloc.create(std.process.Child);
         child.* = std.process.Child.init(argv, self.alloc);
         child.stdout_behavior = .Pipe;
@@ -709,14 +727,21 @@ pub const Bridge = struct {
             // them straight back. Safe here: attachStdio() already ran and
             // both relays captured the real handles by value, so nothing
             // else reads these slots.
+            // Only OpenSSH needs the socket. plink does a plain synchronous
+            // WriteFile on its stdout, which an overlapped handle rejects
+            // with ERROR_INVALID_PARAMETER -- measured: plink reports
+            // "Unable to write to standard output: The parameter is
+            // incorrect" and delivers 0 bytes. It relays an ordinary pipe
+            // correctly, which ssh.exe never does (issue #23).
+            const use_socket = s.client == .openssh;
             const in_pipe = try winMakeStdinPipe();
-            const out_sock = try winMakeStdoutSocket();
+            const out_sock = if (use_socket) try winMakeStdoutSocket() else null;
             const saved_in = win_mod.GetStdHandle(w.STD_INPUT_HANDLE);
             const saved_out = win_mod.GetStdHandle(w.STD_OUTPUT_HANDLE);
             child.stdin_behavior = .Inherit;
-            child.stdout_behavior = .Inherit;
+            child.stdout_behavior = if (use_socket) .Inherit else .Pipe;
             _ = win_mod.SetStdHandle(w.STD_INPUT_HANDLE, in_pipe.rd);
-            _ = win_mod.SetStdHandle(w.STD_OUTPUT_HANDLE, out_sock.child);
+            if (out_sock) |os| _ = win_mod.SetStdHandle(w.STD_OUTPUT_HANDLE, os.child);
             const restore = struct {
                 fn call(m: anytype, ww: anytype, si: ?std.os.windows.HANDLE, so: ?std.os.windows.HANDLE) void {
                     if (si) |h| _ = m.SetStdHandle(ww.STD_INPUT_HANDLE, h);
@@ -727,17 +752,21 @@ pub const Bridge = struct {
                 restore(win_mod, w, saved_in, saved_out);
                 w.CloseHandle(in_pipe.rd);
                 w.CloseHandle(in_pipe.wr);
-                _ = w.ws2_32.closesocket(@ptrCast(out_sock.child));
-                _ = w.ws2_32.closesocket(@ptrCast(out_sock.parent));
+                if (out_sock) |os| {
+                    _ = w.ws2_32.closesocket(@ptrCast(os.child));
+                    _ = w.ws2_32.closesocket(@ptrCast(os.parent));
+                }
                 return err;
             };
             restore(win_mod, w, saved_in, saved_out);
             // The child holds its own inherited copies now. Dropping ours is
             // what lets the read side ever see EOF.
             w.CloseHandle(in_pipe.rd);
-            _ = w.ws2_32.closesocket(@ptrCast(out_sock.child));
+            if (out_sock) |os| _ = w.ws2_32.closesocket(@ptrCast(os.child));
             f.win_stdin_wr = in_pipe.wr;
-            f.win_stdout_rd = out_sock.parent;
+            // plink's stdout came from Child's .Pipe instead.
+            f.win_stdout_rd = if (out_sock) |os| os.parent else child.stdout.?.handle;
+            f.win_stdout_is_socket = use_socket;
         } else {
             child.stdin_behavior = .Pipe;
             try child.spawn();
@@ -979,10 +1008,13 @@ pub const Bridge = struct {
                 }
             }
             // Closing our read end makes the reader's pending overlapped
-            // read complete, so the thread cannot outlive the bridge. It is
-            // a socket, so it closes with closesocket.
+            // read complete, so the thread cannot outlive the bridge.
             if (f.win_stdout_rd) |rh| {
-                _ = std.os.windows.ws2_32.closesocket(@ptrCast(rh));
+                if (f.win_stdout_is_socket) {
+                    _ = std.os.windows.ws2_32.closesocket(@ptrCast(rh));
+                } else {
+                    _ = @import("win.zig").CloseHandle(rh);
+                }
                 f.win_stdout_rd = null;
             }
         } else {
@@ -2802,6 +2834,28 @@ pub fn main() !void {
                 .value => |v| v,
                 .no => unreachable,
             };
+        } else if (matchValueFlag(args, &i, "--ssh-client", null)) |m| {
+            const v = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+            cfg.ssh_client = std.meta.stringToEnum(@import("stdiofwd.zig").Client, v) orelse {
+                log.err("invalid --ssh-client '{s}' (openssh | plink)", .{v});
+                usage();
+            };
+        } else if (matchValueFlag(args, &i, "--ssh-identity", null)) |m| {
+            cfg.ssh_identity = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
+        } else if (matchValueFlag(args, &i, "--ssh-hostkey", null)) |m| {
+            cfg.ssh_hostkey = switch (m) {
+                .missing => usage(),
+                .value => |v| v,
+                .no => unreachable,
+            };
         } else if (matchValueFlag(args, &i, "--static-oauth-client-metadata", null)) |m| {
             const v = switch (m) {
                 .missing => usage(),
@@ -2912,15 +2966,31 @@ pub fn main() !void {
             config_path != null or cfg.enable_proxy or cfg.static_metadata != null or
             cfg.callback_host != null)
         {
-            log.err("stdio forward mode accepts only --ignore-tool, --verbose/-v, --silent and --debug", .{});
+            log.err("stdio forward mode accepts only --ignore-tool, --verbose/-v, --silent, --debug and the --ssh-* options", .{});
             usage();
         }
         if (extra_positional.items.len > 0 and std.meta.activeTag(ft) != .ssh) {
             log.err("trailing arguments are only valid with stdio+ssh://", .{});
             usage();
         }
+        var ft_mut = ft;
+        switch (ft_mut) {
+            .ssh => |*sh| {
+                sh.client = cfg.ssh_client;
+                sh.identity = cfg.ssh_identity;
+                sh.hostkey = cfg.ssh_hostkey;
+            },
+            .tcp => if (cfg.ssh_client != .openssh or cfg.ssh_identity != null or cfg.ssh_hostkey != null) {
+                log.err("--ssh-client/--ssh-identity/--ssh-hostkey are only valid with stdio+ssh://", .{});
+                usage();
+            },
+        }
+        if (cfg.ssh_hostkey != null and cfg.ssh_client != .plink) {
+            log.err("--ssh-hostkey is plink-only; OpenSSH uses known_hosts", .{});
+            usage();
+        }
         cfg.url = u;
-        return runForward(alloc, &cfg, ft);
+        return runForward(alloc, &cfg, ft_mut);
     }
     if (extra_positional.items.len > 0) usage(); // extra args are stdio+ssh-only
     cfg.target = parseUrl(u) catch usage();

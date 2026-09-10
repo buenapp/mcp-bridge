@@ -24,6 +24,16 @@ pub const Target = union(enum) {
     ssh: Ssh,
 };
 
+/// Which local SSH client drives the connection.
+///
+/// They are not interchangeable on Windows, and the difference reaches all
+/// the way into how the child's stdout must be created (issue #23):
+/// OpenSSH's ssh.exe wedges forever on a pipe and needs an OVERLAPPED
+/// loopback socket, while plink does a plain synchronous WriteFile and
+/// rejects an overlapped handle outright with ERROR_INVALID_PARAMETER, so
+/// it needs an ordinary pipe. See fwdStartSsh.
+pub const Client = enum { openssh, plink };
+
 pub const Ssh = struct {
     user: ?[]const u8 = null,
     host: []const u8,
@@ -32,10 +42,21 @@ pub const Ssh = struct {
     path: []const u8,
     /// Extra remote arguments (trailing positional CLI args).
     args: []const []const u8 = &.{},
+    /// --ssh-client: which local client binary to drive.
+    client: Client = .openssh,
+    /// --ssh-identity: private key file. OpenSSH takes any format it
+    /// supports; plink requires a PuTTY .ppk (it cannot read OpenSSH keys).
+    identity: ?[]const u8 = null,
+    /// --ssh-hostkey: expected host key fingerprint, plink only. plink
+    /// -batch aborts on a host key that is not already cached in the
+    /// registry, and has no accept-new equivalent, so an unattended run on
+    /// a fresh host needs this.
+    hostkey: ?[]const u8 = null,
 
     /// Full child argv for the local ssh client. The remote command is
     /// ONE sh-quoted string: path + args joined by spaces.
     pub fn sshArgv(self: *const Ssh, alloc: std.mem.Allocator) Error![][]const u8 {
+        if (self.client == .plink) return self.plinkArgv(alloc);
         var argv: std.ArrayList([]const u8) = .empty;
         argv.append(alloc, "ssh") catch return Error.OutOfMemory;
         // -T: no pty (a pty would echo/mangle the line protocol).
@@ -48,6 +69,39 @@ pub const Ssh = struct {
         if (self.port) |p| {
             argv.append(alloc, "-p") catch return Error.OutOfMemory;
             argv.append(alloc, std.fmt.allocPrint(alloc, "{d}", .{p}) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        }
+        if (self.identity) |k| {
+            argv.append(alloc, "-i") catch return Error.OutOfMemory;
+            argv.append(alloc, k) catch return Error.OutOfMemory;
+        }
+        argv.append(alloc, try self.hostArg(alloc)) catch return Error.OutOfMemory;
+        argv.append(alloc, try self.remoteCommand(alloc)) catch return Error.OutOfMemory;
+        return argv.toOwnedSlice(alloc) catch return Error.OutOfMemory;
+    }
+
+    /// PuTTY plink argv. Deliberately mirrors the OpenSSH form: -T for no
+    /// pty, -batch so an IDE never hangs on a prompt.
+    ///
+    /// plink ignores ~/.ssh/config entirely, so any Host alias, ProxyJump
+    /// or IdentityFile the user relies on there does NOT apply here.
+    fn plinkArgv(self: *const Ssh, alloc: std.mem.Allocator) Error![][]const u8 {
+        var argv: std.ArrayList([]const u8) = .empty;
+        argv.append(alloc, "plink") catch return Error.OutOfMemory;
+        argv.append(alloc, "-batch") catch return Error.OutOfMemory;
+        argv.append(alloc, "-ssh") catch return Error.OutOfMemory;
+        argv.append(alloc, "-T") catch return Error.OutOfMemory;
+        if (self.port) |p| {
+            // plink spells it -P, unlike ssh's -p.
+            argv.append(alloc, "-P") catch return Error.OutOfMemory;
+            argv.append(alloc, std.fmt.allocPrint(alloc, "{d}", .{p}) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        }
+        if (self.identity) |k| {
+            argv.append(alloc, "-i") catch return Error.OutOfMemory;
+            argv.append(alloc, k) catch return Error.OutOfMemory;
+        }
+        if (self.hostkey) |h| {
+            argv.append(alloc, "-hostkey") catch return Error.OutOfMemory;
+            argv.append(alloc, h) catch return Error.OutOfMemory;
         }
         argv.append(alloc, try self.hostArg(alloc)) catch return Error.OutOfMemory;
         argv.append(alloc, try self.remoteCommand(alloc)) catch return Error.OutOfMemory;
@@ -237,6 +291,60 @@ test "sshArgv: flags, port, quoting" {
     const argv2 = try plain.sshArgv(alloc);
     try std.testing.expectEqualStrings("h", argv2[6]);
     try std.testing.expectEqualStrings("'/x'", argv2[7]);
+}
+
+test "sshArgv: openssh identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ssh = Ssh{ .host = "h", .path = "/x", .identity = "/k/id_ed25519" };
+    const argv = try ssh.sshArgv(alloc);
+    try std.testing.expectEqualStrings("-i", argv[6]);
+    try std.testing.expectEqualStrings("/k/id_ed25519", argv[7]);
+    try std.testing.expectEqualStrings("h", argv[8]);
+}
+
+test "plinkArgv: batch flags, -P port, -i, -hostkey, quoting" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ssh = Ssh{
+        .user = "daniel",
+        .host = "freebsd-dev1",
+        .port = 2222,
+        .path = "/opt/bin/vnc-mcp server",
+        .args = &.{"a's b"},
+        .client = .plink,
+        .identity = "C:\\keys\\id.ppk",
+        .hostkey = "SHA256:abc+def/ghi",
+    };
+    const argv = try ssh.sshArgv(alloc);
+    try std.testing.expectEqualStrings("plink", argv[0]);
+    try std.testing.expectEqualStrings("-batch", argv[1]);
+    try std.testing.expectEqualStrings("-ssh", argv[2]);
+    try std.testing.expectEqualStrings("-T", argv[3]);
+    // plink spells the port -P, not -p.
+    try std.testing.expectEqualStrings("-P", argv[4]);
+    try std.testing.expectEqualStrings("2222", argv[5]);
+    try std.testing.expectEqualStrings("-i", argv[6]);
+    try std.testing.expectEqualStrings("C:\\keys\\id.ppk", argv[7]);
+    try std.testing.expectEqualStrings("-hostkey", argv[8]);
+    try std.testing.expectEqualStrings("SHA256:abc+def/ghi", argv[9]);
+    try std.testing.expectEqualStrings("daniel@freebsd-dev1", argv[10]);
+    // The remote command is sh-quoted exactly as for OpenSSH.
+    try std.testing.expectEqualStrings("'/opt/bin/vnc-mcp server' 'a'\"'\"'s b'", argv[11]);
+}
+
+test "plinkArgv: minimal form omits optional flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ssh = Ssh{ .host = "h", .path = "/x", .client = .plink };
+    const argv = try ssh.sshArgv(alloc);
+    try std.testing.expectEqual(@as(usize, 6), argv.len);
+    try std.testing.expectEqualStrings("plink", argv[0]);
+    try std.testing.expectEqualStrings("h", argv[4]);
+    try std.testing.expectEqualStrings("'/x'", argv[5]);
 }
 
 test "shQuote round trips odd bytes" {
