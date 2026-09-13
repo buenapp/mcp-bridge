@@ -504,9 +504,16 @@ const conn = try client.Conn.startPost(alloc, evp, handler, target, request, nul
 
 `request` comes from `client.buildRequest(...)`; the `Handler` callbacks
 (`onResponse`, `onStreamHead`, `onEvent`, `onEnd`) drive the connection
-from the event loop. Note: `PostCtx.expect_id == null` means "the first
-SSE message event is the response" — MCP notification semantics. For a
-token stream (OpenAI-style completions) verify that behaviour first.
+from the event loop.
+
+For a **token stream** (OpenAI-style streaming completions — a POST
+whose response is `text/event-stream`) start the conn with
+`client.Conn.startPostStream(...)` instead: `onStreamHead` is consulted
+(call `proceedStream()` or `close()`), every event is delivered to
+`onEvent` with nothing claimed as a response, and stream end is a clean
+`onEnd(null)`. (`PostCtx.expect_id` on a plain `.post` instead means
+"the first SSE message event is the response" — MCP notification
+semantics, which is not what a token stream wants.)
 
 ## DANE policy
 
