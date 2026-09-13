@@ -446,6 +446,68 @@ zig build -Dtarget=x86_64-linux-gnu              # Linux (needs OpenSSL dev file
 Runtime dependencies: none on Windows; base-system OpenSSL on FreeBSD;
 distro OpenSSL 3 (`libssl.so.3`) + glibc on Linux.
 
+## Using as a Zig module
+
+Downstream Zig packages can import the event-driven HTTP/TLS/DANE/SSE
+client layer directly — same engine this bridge uses, without the stdio
+front-end (issue #28). One `httpc.Conn` is one upstream connection on the
+born event port: a POST whose response is plain JSON **or** an SSE frame
+stream, or a long-lived GET event stream. Nothing blocks, nothing polls,
+no threads.
+
+In `build.zig.zon` (URL + hash from `zig fetch`):
+
+```zig
+.dependencies = .{
+    .mcp_bridge = .{
+        .url = "https://pacyworld.dev/buenapp/mcp-bridge/archive/<ref>.tar.gz",
+        .hash = "...",
+    },
+},
+```
+
+In `build.zig`:
+
+```zig
+const mb = b.dependency("mcp_bridge", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("mcp-bridge-client", mb.module("mcp-bridge-client"));
+```
+
+The module carries its own platform link wiring (Windows
+`ws2_32`/`secur32`/`crypt32`/`dnsapi`, FreeBSD base OpenSSL, native-Linux
+distro OpenSSL) — nothing further is needed for native builds. For
+**Linux-gnu cross builds** the consumer must additionally pin glibc on
+its own root module (zig does not retarget it for you) and provide a
+`.sysroot/ubuntu-24.04` directory in the consumer checkout:
+
+```zig
+if (!target.query.isNative() and target.result.os.tag == .linux and
+    target.result.abi == .gnu and target.query.glibc_version == null)
+{
+    var q = target.query;
+    q.glibc_version = .{ .major = 2, .minor = 39, .patch = 0 };
+    target = b.resolveTargetQuery(q);
+}
+```
+
+`linkPlatform()` in `build.zig` is the reference for the exact link
+setup if a consumer needs more control.
+
+Entry points (all re-exported from `src/client.zig`):
+
+```zig
+const client = @import("mcp-bridge-client");
+const target = try client.parseUrl("https://example.com/api");
+var verifier = try client.Verifier.init(alloc, target.host, target.port); // https only
+const conn = try client.Conn.startPost(alloc, evp, handler, target, request, null, null, &verifier);
+```
+
+`request` comes from `client.buildRequest(...)`; the `Handler` callbacks
+(`onResponse`, `onStreamHead`, `onEvent`, `onEnd`) drive the connection
+from the event loop. Note: `PostCtx.expect_id == null` means "the first
+SSE message event is the response" — MCP notification semantics. For a
+token stream (OpenAI-style completions) verify that behaviour first.
+
 ## DANE policy
 
 1. TLSA lookup for `_<port>._tcp.<host>` (Windows DnsQuery / POSIX

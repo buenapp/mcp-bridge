@@ -26,6 +26,14 @@
   bounded retries, GET resume and session deletion.
 
 ## Architecture (post issue #7 rework; event port lives in born since PR #9)
+- Importable module (issue #28): `src/client.zig` is registered in
+  build.zig as "mcp-bridge-client" for downstream packages (UnAgent et
+  al.). `linkPlatform()` is the single source of platform link wiring —
+  used by the exe, the host tests, and the module. `b.option` CANNOT be
+  re-declared: `linux-sysroot` is resolved once in build() and passed
+  down. The module carries its wiring transitively, but a downstream
+  Linux-gnu cross build must still pin glibc 2.39 itself and provide
+  .sysroot/ubuntu-24.04 in its own checkout (see README).
 - Single event loop over born (`@import("born")`, pinned in
   build.zig.zon; kqueue FreeBSD / epoll Linux / IOCP Windows). No socket
   I/O threads, no timers/select/poll; inherited Windows stdio uses the

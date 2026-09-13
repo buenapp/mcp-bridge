@@ -36,6 +36,67 @@ fn linkDistroLib(b: *std.Build, mod: *std.Build.Module, name: []const u8, soname
     mod.linkSystemLibrary(name, .{});
 }
 
+/// Platform link wiring shared by the executable, the host test binary,
+/// and the mcp-bridge-client module (issue #28). Previously pasted twice
+/// and already drifted (native-Linux tests never got the linkDistroLib
+/// path the executable needs). Downstream consumers of the module must
+/// repeat this wiring on their own root module; this function is the
+/// reference implementation.
+fn linkPlatform(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, linux_sysroot: []const u8) void {
+    if (target.result.os.tag == .windows) {
+        mod.linkSystemLibrary("ws2_32", .{});
+        mod.linkSystemLibrary("secur32", .{});
+        mod.linkSystemLibrary("crypt32", .{});
+        mod.linkSystemLibrary("dnsapi", .{});
+        mod.linkSystemLibrary("kernel32", .{});
+        mod.linkSystemLibrary("shell32", .{}); // ShellExecuteA (OAuth browser launch)
+    } else {
+        // POSIX: OpenSSL TLS backend. libc is required for @cImport and the
+        // system resolver. FreeBSD has res_query/ns_* in libc; glibc needs
+        // libresolv linked explicitly.
+        mod.link_libc = true;
+        if (target.result.os.tag == .freebsd) {
+            // Link BASE OpenSSL, not ports: ports (/usr/local/lib) wins the
+            // default -l search, but its trust dir (/usr/local/openssl/certs)
+            // is not certctl-managed and the port may not be installed on a
+            // target system. /usr/lib/libssl.so is the base linker symlink;
+            // link it directly to bypass search order, and prefer base
+            // headers (/usr/include) over ports headers (/usr/local/include).
+            mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+            mod.addObjectFile(.{ .cwd_relative = "/usr/lib/libssl.so" });
+            mod.addObjectFile(.{ .cwd_relative = "/usr/lib/libcrypto.so" });
+        } else if (target.result.os.tag == .linux) {
+            if (target.query.isNative()) {
+                // NATIVE Linux build (CI runners, dev machines): use the
+                // system toolchain, no glibc pin. Distro layouts differ
+                // (Debian multiarch vs Fedora lib64) so link by absolute
+                // path; -lresolv in particular is silently dropped by zig
+                // (it assumes libresolv is folded into glibc >= 2.34 — true
+                // for res_query, but ns_initparse/ns_parserr still live in
+                // libresolv.so.2).
+                mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+                mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+                linkDistroLib(b, mod, "ssl", "3");
+                linkDistroLib(b, mod, "crypto", "3");
+                // No libresolv: dns_posix.zig uses res_query (in libc on
+                // glibc >= 2.34 and FreeBSD) + a hand-rolled answer parser.
+            } else {
+                // CROSS build (from FreeBSD): bundled pinned glibc (its
+                // abilist covers libresolv — zig drops -lresolv harmlessly)
+                // plus a pinned OpenSSL sysroot (default
+                // .sysroot/ubuntu-24.04, headers + libs from the distro
+                // package). Link sysroot objects directly: the host's
+                // /usr/local/lib otherwise wins and LLD happily links the
+                // wrong-OS libssl.
+                const sysroot = linux_sysroot;
+                mod.addSystemIncludePath(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/include", .{sysroot}) catch @panic("oom") });
+                mod.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/lib/libssl.so", .{sysroot}) catch @panic("oom") });
+                mod.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/lib/libcrypto.so", .{sysroot}) catch @panic("oom") });
+            }
+        }
+    }
+}
+
 pub fn build(b: *std.Build) void {
     var target = b.standardTargetOptions(.{
         .default_target = .{
@@ -61,9 +122,25 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
+    // OpenSSL sysroot (include/ + lib/) for Linux cross builds. Declared
+    // once here: zig panics on a b.option() re-declaration, and
+    // linkPlatform() runs once per consumer.
+    const linux_sysroot = b.option([]const u8, "linux-sysroot", "OpenSSL sysroot (include/ + lib/) for Linux cross builds") orelse ".sysroot/ubuntu-24.04";
+
     // The event port lives in born now; see docs in that repo for the
     // read-persistent/write-oneshot contract these call sites rely on.
     const born = b.dependency("born", .{ .target = target, .optimize = optimize });
+
+    // Importable module (issue #28): the event-driven HTTP/TLS/DANE/SSE
+    // client layer for downstream packages (UnAgent et al.). No
+    // build_options plumbing — no file in the closure references it.
+    const client = b.addModule("mcp-bridge-client", .{
+        .root_source_file = b.path("src/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client.addImport("born", born.module("born"));
+    linkPlatform(b, client, target, linux_sysroot);
 
     const exe = b.addExecutable(.{
         .name = "mcp-bridge",
@@ -82,58 +159,8 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .windows) {
         // Icon + version info (Windows resource script, compiled by zig's rc)
         exe.addWin32ResourceFile(.{ .file = b.path("assets/mcp-bridge.rc") });
-
-        exe.root_module.linkSystemLibrary("ws2_32", .{});
-        exe.root_module.linkSystemLibrary("secur32", .{});
-        exe.root_module.linkSystemLibrary("crypt32", .{});
-        exe.root_module.linkSystemLibrary("dnsapi", .{});
-        exe.root_module.linkSystemLibrary("kernel32", .{});
-        exe.root_module.linkSystemLibrary("shell32", .{}); // ShellExecuteA (OAuth browser launch)
-    } else {
-        // POSIX: OpenSSL TLS backend. libc is required for @cImport and the
-        // system resolver. FreeBSD has res_query/ns_* in libc; glibc needs
-        // libresolv linked explicitly.
-        exe.root_module.link_libc = true;
-        if (target.result.os.tag == .freebsd) {
-            // Link BASE OpenSSL, not ports: ports (/usr/local/lib) wins the
-            // default -l search, but its trust dir (/usr/local/openssl/certs)
-            // is not certctl-managed and the port may not be installed on a
-            // target system. /usr/lib/libssl.so is the base linker symlink;
-            // link it directly to bypass search order, and prefer base
-            // headers (/usr/include) over ports headers (/usr/local/include).
-            exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-            exe.root_module.addObjectFile(.{ .cwd_relative = "/usr/lib/libssl.so" });
-            exe.root_module.addObjectFile(.{ .cwd_relative = "/usr/lib/libcrypto.so" });
-        } else if (target.result.os.tag == .linux) {
-            if (target.query.isNative()) {
-                // NATIVE Linux build (CI runners, dev machines): use the
-                // system toolchain, no glibc pin. Distro layouts differ
-                // (Debian multiarch vs Fedora lib64) so link by absolute
-                // path; -lresolv in particular is silently dropped by zig
-                // (it assumes libresolv is folded into glibc >= 2.34 — true
-                // for res_query, but ns_initparse/ns_parserr still live in
-                // libresolv.so.2).
-                exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-                exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
-                linkDistroLib(b, exe.root_module, "ssl", "3");
-                linkDistroLib(b, exe.root_module, "crypto", "3");
-                // No libresolv: dns_posix.zig uses res_query (in libc on
-                // glibc >= 2.34 and FreeBSD) + a hand-rolled answer parser.
-            } else {
-                // CROSS build (from FreeBSD): bundled pinned glibc (its
-                // abilist covers libresolv — zig drops -lresolv harmlessly)
-                // plus a pinned OpenSSL sysroot (default
-                // .sysroot/ubuntu-24.04, headers + libs from the distro
-                // package). Link sysroot objects directly: the host's
-                // /usr/local/lib otherwise wins and LLD happily links the
-                // wrong-OS libssl.
-                const sysroot = b.option([]const u8, "linux-sysroot", "OpenSSL sysroot (include/ + lib/) for Linux cross builds") orelse ".sysroot/ubuntu-24.04";
-                exe.root_module.addSystemIncludePath(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/include", .{sysroot}) catch @panic("oom") });
-                exe.root_module.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/lib/libssl.so", .{sysroot}) catch @panic("oom") });
-                exe.root_module.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/lib/libcrypto.so", .{sysroot}) catch @panic("oom") });
-            }
-        }
     }
+    linkPlatform(b, exe.root_module, target, linux_sysroot);
 
     b.installArtifact(exe);
 
@@ -150,24 +177,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("born", born_host.module("born"));
-    if (b.graph.host.result.os.tag == .windows) {
-        tests.root_module.linkSystemLibrary("ws2_32", .{});
-        tests.root_module.linkSystemLibrary("secur32", .{});
-        tests.root_module.linkSystemLibrary("crypt32", .{});
-        tests.root_module.linkSystemLibrary("dnsapi", .{});
-        tests.root_module.linkSystemLibrary("kernel32", .{});
-        tests.root_module.linkSystemLibrary("shell32", .{});
-    } else {
-        tests.root_module.link_libc = true;
-        if (b.graph.host.result.os.tag == .freebsd) {
-            tests.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-            tests.root_module.addObjectFile(.{ .cwd_relative = "/usr/lib/libssl.so" });
-            tests.root_module.addObjectFile(.{ .cwd_relative = "/usr/lib/libcrypto.so" });
-        } else if (b.graph.host.result.os.tag == .linux) {
-            tests.root_module.linkSystemLibrary("ssl", .{});
-            tests.root_module.linkSystemLibrary("crypto", .{});
-        }
-    }
+    linkPlatform(b, tests.root_module, b.graph.host, linux_sysroot);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests (host)");
     test_step.dependOn(&run_tests.step);
