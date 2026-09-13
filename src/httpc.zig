@@ -4,7 +4,10 @@
 //   .post     — one request, one complete response. Plain JSON body, or an
 //               SSE-framed body where the event whose JSON-RPC id matches
 //               expect_id becomes the response and all other events are
-//               delivered as push events.
+//               delivered as push events. With PostCtx.stream (started via
+//               startPostStream) the SSE body is instead delivered whole
+//               to onEvent — the head is consulted via onStreamHead and
+//               stream end is a clean onEnd(null) (issue #30).
 //   .sse_get  — long-lived text/event-stream (legacy transport GET stream,
 //               Streamable HTTP standalone GET push stream).
 //
@@ -65,11 +68,17 @@ pub const Role = union(enum) {
 
 pub const PostCtx = struct {
     /// Raw JSON-RPC id to match in an SSE-framed response (null =
-    /// notification: first message event wins). Owned.
+    /// notification: first message event wins). Owned. Not consulted
+    /// when stream is true.
     expect_id: ?[]const u8 = null,
     /// Original stdin line, kept for resend (transport fallback /
     /// stale-connection retry). Owned.
     line: ?[]const u8 = null,
+    /// Streaming response (issue #30): the POST's SSE body is delivered
+    /// whole to onEvent — onStreamHead is consulted, no event is claimed
+    /// as a response, and stream end is a clean onEnd(null). Set via
+    /// startPostStream.
+    stream: bool = false,
     /// True when this POST rides a reused keep-alive connection.
     reused: bool = false,
     /// Which transport created this POST (responses route on this, not on
@@ -86,9 +95,10 @@ pub const PostCtx = struct {
 
 /// Synchronous callbacks into the bridge (single-threaded; invoked from
 /// drive()). onResponse hands over an owned Response (deinit with
-/// conn.alloc). onStreamHead must call conn.proceedStream() or
-/// conn.close(). onEnd reports termination: err == null is a clean end
-/// (stream EOF, idle close), non-null a failure.
+/// conn.alloc). onStreamHead — sse_get conns, and post conns started via
+/// startPostStream — must call conn.proceedStream() or conn.close().
+/// onEnd reports termination: err == null is a clean end (stream EOF,
+/// idle close), non-null a failure.
 pub const Handler = struct {
     ctx: *anyopaque,
     onResponse: *const fn (ctx: *anyopaque, conn: *Conn, resp: http.Response) void,
@@ -351,6 +361,22 @@ pub const Conn = struct {
         return start(alloc, evp, handler, target, request, role, verifier);
     }
 
+    /// Create + start a streaming POST conn (issue #30): the SSE-framed
+    /// response is delivered whole to the handler's onEvent, the head is
+    /// consulted via onStreamHead (call proceedStream() or close()), and
+    /// stream end is a clean onEnd(null). `request` is moved (conn frees
+    /// it). verifier: required for https targets.
+    pub fn startPostStream(
+        alloc: std.mem.Allocator,
+        evp: *evport.EvPort,
+        handler: Handler,
+        target: http.Target,
+        request: std.ArrayList(u8),
+        verifier: ?*platform.Verifier,
+    ) Error!*Conn {
+        return start(alloc, evp, handler, target, request, .{ .post = .{ .stream = true } }, verifier);
+    }
+
     /// Create + start a long-lived GET stream conn.
     pub fn startStreamGet(
         alloc: std.mem.Allocator,
@@ -441,7 +467,8 @@ pub const Conn = struct {
         self.alloc.destroy(self);
     }
 
-    /// sse_get role, from onStreamHead: proceed into the event stream.
+    /// sse_get or streaming-post role, from onStreamHead: proceed into
+    /// the event stream.
     pub fn proceedStream(self: *Conn) void {
         self.state = .sse_stream;
         self.parser = sse.Parser.init(self.alloc);
@@ -888,10 +915,16 @@ pub const Conn = struct {
         self.rpos = he + 4;
 
         switch (self.role) {
-            .post => {
+            .post => |p| {
                 if (h.is_sse) {
-                    self.state = .sse_stream;
-                    self.parser = sse.Parser.init(self.alloc);
+                    if (p.stream) {
+                        // Streaming POST: the handler owns the head —
+                        // it calls proceedStream() or close().
+                        self.handler.onStreamHead(self.handler.ctx, self, h.status, h.is_sse, h.session_id, h.www_authenticate);
+                    } else {
+                        self.state = .sse_stream;
+                        self.parser = sse.Parser.init(self.alloc);
+                    }
                 } else {
                     self.state = .read_body;
                 }
@@ -957,16 +990,22 @@ pub const Conn = struct {
             switch (self.role) {
                 .sse_get => self.handler.onEvent(self.handler.ctx, self, &ev),
                 .post => |*p| {
-                    const is_match = if (p.expect_id) |eid| blk: {
-                        const pid = mcp.getRequestId(ev.data) orelse break :blk false;
-                        break :blk std.mem.eql(u8, pid, eid);
-                    } else true; // notification: first message event wins
-                    if (is_match) {
-                        self.sse_got_response = true;
-                        self.finishResponseWith(ev.data);
-                        return count;
+                    if (p.stream) {
+                        // Streaming POST: every event reaches the handler;
+                        // none is claimed as a response.
+                        self.handler.onEvent(self.handler.ctx, self, &ev);
+                    } else {
+                        const is_match = if (p.expect_id) |eid| blk: {
+                            const pid = mcp.getRequestId(ev.data) orelse break :blk false;
+                            break :blk std.mem.eql(u8, pid, eid);
+                        } else true; // notification: first message event wins
+                        if (is_match) {
+                            self.sse_got_response = true;
+                            self.finishResponseWith(ev.data);
+                            return count;
+                        }
+                        self.handler.onEvent(self.handler.ctx, self, &ev);
                     }
-                    self.handler.onEvent(self.handler.ctx, self, &ev);
                 },
             }
             if (self.closing or self.state == .done) return count;
@@ -982,8 +1021,10 @@ pub const Conn = struct {
         self.state = .done;
         switch (self.role) {
             .sse_get => self.handler.onEnd(self.handler.ctx, self, null),
-            .post => {
-                if (!self.sse_got_response) {
+            .post => |p| {
+                if (p.stream) {
+                    self.handler.onEnd(self.handler.ctx, self, null);
+                } else if (!self.sse_got_response) {
                     self.handler.onEnd(self.handler.ctx, self, error.SseEndedWithoutResponse);
                 }
             },

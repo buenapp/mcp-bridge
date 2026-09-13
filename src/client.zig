@@ -11,10 +11,11 @@
 // a system-trust fallback (platform.Verifier).
 //
 // MCP-shaped but inert for non-MCP callers: pass PostCtx defaults and
-// ignore http.Response.mcp_session_id. NOTE: expect_id == null means
-// "first SSE message event wins" — correct for MCP notifications, wrong
-// for a token stream; do not use the .post role for OpenAI-style
-// streaming completions without verifying that behaviour.
+// ignore http.Response.mcp_session_id. For a token stream
+// (OpenAI-style streaming completions — a POST whose response is
+// text/event-stream), use client.Conn.startPostStream: the head is
+// consulted via onStreamHead, every event is delivered to onEvent, and
+// stream end is a clean onEnd(null) (issue #30).
 //
 // Nothing here touches build_options; the module needs only the born
 // import plus the platform link wiring. A downstream build.zig must

@@ -65,7 +65,12 @@ fn onStreamHead(ctx: *anyopaque, conn: *httpc.Conn, status: u16, is_sse: bool, s
     self.head_status = status;
     self.head_is_sse = is_sse;
     if (www_authenticate) |wa| self.head_www_authenticate = self.alloc.dupe(u8, wa) catch null;
-    if (self.proceed) conn.proceedStream() else conn.close();
+    if (self.proceed) {
+        conn.proceedStream();
+    } else {
+        conn.close();
+        self.done = true;
+    }
 }
 
 fn onEvent(ctx: *anyopaque, conn: *httpc.Conn, ev: *const sse.Event) void {
@@ -304,6 +309,98 @@ test "httpc sse_get: head, events, clean EOF" {
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/y\"}", ctx.events.items[1]);
     try std.testing.expect(ctx.ended);
     try std.testing.expect(ctx.end_err == null);
+
+    mock.join();
+}
+
+fn mockTokenStreamMain(mock: *Mock) void {
+    const alloc = mock.alloc;
+    var c = mock.server.accept() catch return;
+    var req = readRequest(alloc, &c.stream) catch {
+        sockClose(&c.stream);
+        return;
+    };
+    defer req.deinit(alloc);
+    writeAll(&c.stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n") catch return;
+    // OpenAI-shaped completion stream: 5 token chunks then [DONE].
+    writeAll(&c.stream, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n") catch return;
+    writeAll(&c.stream, "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n") catch return;
+    writeAll(&c.stream, "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n") catch return;
+    writeAll(&c.stream, "data: {\"choices\":[{\"delta\":{\"content\":\" How\"}}]}\n\n") catch return;
+    writeAll(&c.stream, "data: {\"choices\":[{\"delta\":{\"content\":\" now?\"}}]}\n\n") catch return;
+    writeAll(&c.stream, "data: [DONE]\n\n") catch return;
+    sockClose(&c.stream); // clean stream end
+}
+
+test "httpc post stream: token stream delivered whole, clean end (issue #30)" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mockTokenStreamMain);
+
+    var evp = try evport.EvPort.init(alloc);
+    defer evp.deinit();
+    var ctx = Ctx{ .alloc = alloc };
+    const hnd = harness(&ctx);
+    defer ctx.deinit();
+
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1/chat/completions", .{mock.port()});
+    defer alloc.free(url);
+    const target = try http.parseUrl(url);
+
+    const line = "{\"model\":\"m\",\"stream\":true,\"messages\":[]}";
+    const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "text/event-stream", "application/json", &.{}, line);
+    const conn = try httpc.Conn.startPostStream(alloc, &evp, hnd, target, req, null);
+    try runToDone(&evp, &ctx);
+    defer reap(conn);
+
+    // The head was consulted, not swallowed.
+    try std.testing.expectEqual(@as(u16, 200), ctx.head_status.?);
+    try std.testing.expect(ctx.head_is_sse);
+    // Every event reached onEvent; nothing became a response.
+    try std.testing.expectEqual(@as(?u16, null), ctx.resp_status);
+    try std.testing.expectEqual(@as(usize, 6), ctx.events.items.len);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}", ctx.events.items[0]);
+    try std.testing.expectEqualStrings("[DONE]", ctx.events.items[5]);
+    // Stream end is clean (no SseEndedWithoutResponse sentinel).
+    try std.testing.expect(ctx.ended);
+    try std.testing.expect(ctx.end_err == null);
+
+    mock.join();
+}
+
+test "httpc post stream: handler declines the head (close)" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mockTokenStreamMain);
+
+    var evp = try evport.EvPort.init(alloc);
+    defer evp.deinit();
+    var ctx = Ctx{ .alloc = alloc, .proceed = false };
+    const hnd = harness(&ctx);
+    defer ctx.deinit();
+
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1/chat/completions", .{mock.port()});
+    defer alloc.free(url);
+    const target = try http.parseUrl(url);
+
+    const line = "{\"model\":\"m\",\"stream\":true,\"messages\":[]}";
+    const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "text/event-stream", "application/json", &.{}, line);
+    const conn = try httpc.Conn.startPostStream(alloc, &evp, hnd, target, req, null);
+    try runToDone(&evp, &ctx);
+    defer reap(conn);
+
+    // Head was offered, the handler closed: no events, no response, no onEnd.
+    try std.testing.expectEqual(@as(u16, 200), ctx.head_status.?);
+    try std.testing.expect(ctx.head_is_sse);
+    try std.testing.expectEqual(@as(usize, 0), ctx.events.items.len);
+    try std.testing.expectEqual(@as(?u16, null), ctx.resp_status);
+    try std.testing.expect(!ctx.ended);
 
     mock.join();
 }
