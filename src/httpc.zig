@@ -226,14 +226,15 @@ const BodyPump = struct {
     }
 };
 
-/// Parsed response headers. session_id / www_authenticate are owned dupes
-/// (the raw buffer gets compacted under long-lived streams).
+/// Parsed response headers. session_id / www_authenticate / retry_after are
+/// owned dupes (the raw buffer gets compacted under long-lived streams).
 const Head = struct {
     status: u16,
     header_end: usize, // offset of "\r\n\r\n" within the buffer
     content_length: ?usize,
     session_id: ?[]u8 = null,
     www_authenticate: ?[]u8 = null,
+    retry_after: ?[]u8 = null,
     server_closed: bool,
     chunked: bool,
     is_sse: bool,
@@ -241,6 +242,7 @@ const Head = struct {
     fn deinit(self: *Head, alloc: std.mem.Allocator) void {
         if (self.session_id) |s| alloc.free(s);
         if (self.www_authenticate) |s| alloc.free(s);
+        if (self.retry_after) |s| alloc.free(s);
     }
 };
 
@@ -255,12 +257,11 @@ fn parseHead(alloc: std.mem.Allocator, buf: []const u8, header_end: usize) Error
     const conn_hdr = http.getHeaderValue(head, "connection");
     const sid_raw = http.getHeaderValue(head, "mcp-session-id");
     const wa_raw = http.getHeaderValue(head, "www-authenticate");
-    return .{
+    const ra_raw = http.getHeaderValue(head, "retry-after");
+    var parsed: Head = .{
         .status = status,
         .header_end = header_end,
         .content_length = http.getHeaderNumeric(head, "content-length"),
-        .session_id = if (sid_raw) |s| alloc.dupe(u8, s) catch return Error.OutOfMemory else null,
-        .www_authenticate = if (wa_raw) |s| alloc.dupe(u8, s) catch return Error.OutOfMemory else null,
         .server_closed = if (conn_hdr) |v| std.ascii.eqlIgnoreCase(v, "close") else false,
         .chunked = if (http.getHeaderValue(head, "transfer-encoding")) |v|
             std.ascii.indexOfIgnoreCase(v, "chunked") != null
@@ -271,6 +272,11 @@ fn parseHead(alloc: std.mem.Allocator, buf: []const u8, header_end: usize) Error
         else
             false,
     };
+    errdefer parsed.deinit(alloc);
+    if (sid_raw) |s| parsed.session_id = alloc.dupe(u8, s) catch return Error.OutOfMemory;
+    if (wa_raw) |s| parsed.www_authenticate = alloc.dupe(u8, s) catch return Error.OutOfMemory;
+    if (ra_raw) |s| parsed.retry_after = alloc.dupe(u8, s) catch return Error.OutOfMemory;
+    return parsed;
 }
 
 fn bodyMode(h: *const Head) BodyMode {
@@ -465,6 +471,14 @@ pub const Conn = struct {
             .sse_get => {},
         }
         self.alloc.destroy(self);
+    }
+
+    /// The response's `Retry-After` header as sent (delay-seconds or an
+    /// HTTP-date), or null. Valid while the head is held: inside
+    /// onStreamHead and onResponse, and until makeIdle or close.
+    pub fn retryAfter(self: *const Conn) ?[]const u8 {
+        const h = self.head orelse return null;
+        return h.retry_after;
     }
 
     /// sse_get or streaming-post role, from onStreamHead: proceed into

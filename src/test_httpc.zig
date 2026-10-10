@@ -31,6 +31,9 @@ const Ctx = struct {
     head_status: ?u16 = null,
     head_is_sse: bool = false,
     head_www_authenticate: ?[]u8 = null,
+    /// conn.retryAfter() as seen inside onResponse / onStreamHead
+    resp_retry_after: ?[]u8 = null,
+    head_retry_after: ?[]u8 = null,
     proceed: bool = true,
     /// onEvent captures (owned dupes)
     events: std.ArrayList([]u8) = .empty,
@@ -42,6 +45,8 @@ const Ctx = struct {
         if (self.resp_body) |b| self.alloc.free(b);
         if (self.resp_session_id) |s| self.alloc.free(s);
         if (self.head_www_authenticate) |s| self.alloc.free(s);
+        if (self.resp_retry_after) |s| self.alloc.free(s);
+        if (self.head_retry_after) |s| self.alloc.free(s);
         for (self.events.items) |e| self.alloc.free(e);
         self.events.deinit(self.alloc);
     }
@@ -54,6 +59,7 @@ fn onResponse(ctx: *anyopaque, conn: *httpc.Conn, resp: http.Response) void {
     self.resp_body = self.alloc.dupe(u8, r.body) catch null;
     self.resp_session_id = if (r.mcp_session_id) |s| self.alloc.dupe(u8, s) catch null else null;
     self.resp_server_closed = r.server_closed;
+    if (conn.retryAfter()) |ra| self.resp_retry_after = self.alloc.dupe(u8, ra) catch null;
     r.deinit(conn.alloc);
     conn.close();
     self.done = true;
@@ -65,6 +71,7 @@ fn onStreamHead(ctx: *anyopaque, conn: *httpc.Conn, status: u16, is_sse: bool, s
     self.head_status = status;
     self.head_is_sse = is_sse;
     if (www_authenticate) |wa| self.head_www_authenticate = self.alloc.dupe(u8, wa) catch null;
+    if (conn.retryAfter()) |ra| self.head_retry_after = self.alloc.dupe(u8, ra) catch null;
     if (self.proceed) {
         conn.proceedStream();
     } else {
@@ -442,6 +449,85 @@ test "httpc post: error status surfaces with empty body" {
     try std.testing.expectEqual(@as(u16, 405), ctx.resp_status.?);
     try std.testing.expectEqualStrings("", ctx.resp_body.?);
     try std.testing.expect(ctx.resp_server_closed);
+
+    mock.join();
+}
+
+fn mock503RetryAfterMain(mock: *Mock) void {
+    const alloc = mock.alloc;
+    var c = mock.server.accept() catch return;
+    defer sockClose(&c.stream);
+    var req = readRequest(alloc, &c.stream) catch return;
+    defer req.deinit(alloc);
+    writeAll(&c.stream, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 7\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy") catch return;
+    drainUntilClose(&c.stream);
+}
+
+fn mockSseRetryAfterMain(mock: *Mock) void {
+    const alloc = mock.alloc;
+    var c = mock.server.accept() catch return;
+    defer sockClose(&c.stream);
+    var req = readRequest(alloc, &c.stream) catch return;
+    defer req.deinit(alloc);
+    writeAll(&c.stream, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/event-stream\r\nretry-after: Wed, 21 Oct 2026 07:28:00 GMT\r\nConnection: close\r\n\r\n") catch return;
+    drainUntilClose(&c.stream);
+}
+
+test "httpc post: Retry-After is readable from onResponse" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mock503RetryAfterMain);
+
+    var evp = try evport.EvPort.init(alloc);
+    defer evp.deinit();
+    var ctx = Ctx{ .alloc = alloc };
+    const hnd = harness(&ctx);
+    defer ctx.deinit();
+
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1/chat/completions", .{mock.port()});
+    defer alloc.free(url);
+    const target = try http.parseUrl(url);
+    const body = "{}";
+    const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "text/event-stream", "application/json", &.{}, body);
+    const conn = try httpc.Conn.startPostStream(alloc, &evp, hnd, target, req, null);
+    try runToDone(&evp, &ctx);
+    reap(conn);
+
+    try std.testing.expectEqual(@as(u16, 503), ctx.resp_status.?);
+    try std.testing.expectEqualStrings("busy", ctx.resp_body.?);
+    try std.testing.expectEqualStrings("7", ctx.resp_retry_after.?);
+
+    mock.join();
+}
+
+test "httpc post stream: Retry-After is readable from onStreamHead" {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer if (gpa_state.deinit() == .leak) @panic("memory leak");
+    const alloc = gpa_state.allocator();
+
+    var mock = try Mock.start(alloc);
+    try mock.spawn(mockSseRetryAfterMain);
+
+    var evp = try evport.EvPort.init(alloc);
+    defer evp.deinit();
+    var ctx = Ctx{ .alloc = alloc, .proceed = false };
+    const hnd = harness(&ctx);
+    defer ctx.deinit();
+
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1/messages", .{mock.port()});
+    defer alloc.free(url);
+    const target = try http.parseUrl(url);
+    const body = "{}";
+    const req = try httpc.buildRequest(alloc, "POST", target.path, target.host, "text/event-stream", "application/json", &.{}, body);
+    const conn = try httpc.Conn.startPostStream(alloc, &evp, hnd, target, req, null);
+    try runToDone(&evp, &ctx);
+    reap(conn);
+
+    try std.testing.expectEqual(@as(u16, 429), ctx.head_status.?);
+    try std.testing.expectEqualStrings("Wed, 21 Oct 2026 07:28:00 GMT", ctx.head_retry_after.?);
 
     mock.join();
 }
