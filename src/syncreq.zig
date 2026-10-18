@@ -80,10 +80,8 @@ pub fn request(
     body: ?[]const u8,
     verifier: ?*platform.Verifier,
 ) Error!http.Response {
-    var evp = evport.EvPort.init(alloc) catch |err| switch (err) {
-        error.OutOfMemory => return Error.OutOfMemory,
-        else => return Error.EventPortFailed,
-    };
+    // init allocates nothing; every failure is the port itself.
+    var evp = evport.EvPort.init(alloc) catch return Error.EventPortFailed;
     defer evp.deinit();
 
     var ctx = Ctx{};
