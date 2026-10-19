@@ -121,6 +121,23 @@ pub const Ssh = struct {
     }
 };
 
+/// Win32-OpenSSH's posix_spawn records the fd types of a child's stdio in
+/// this variable, and the child's fd_table_initialize applies them to its
+/// own std handles before clearing it. sshd sets it for the session shell;
+/// a non-OpenSSH shell (PowerShell, cmd) never clears it, so every process
+/// started in that session inherits it. An ssh.exe spawned by the bridge
+/// would then drive our pipes with the session's fd types instead of
+/// probing them, and stall after its first read (issue #36).
+pub const win32_openssh_fd_state = "c28fc6f98a2c44abbbd89d6a3037d0d9_POSIX_FD_STATE";
+
+/// Remove variables from the ssh child's environment that describe handles
+/// other than the ones the bridge passes it. Returns true if one was found.
+pub fn scrubSshEnv(env: *std.process.EnvMap) bool {
+    if (env.get(win32_openssh_fd_state) == null) return false;
+    env.remove(win32_openssh_fd_state);
+    return true;
+}
+
 /// POSIX-sh single-quote escape: safe embedding into a remote shell
 /// command line no matter what the bytes are (' becomes '"'"').
 pub fn shQuote(alloc: std.mem.Allocator, s: []const u8) Error![]const u8 {
@@ -342,6 +359,22 @@ test "plinkArgv: minimal form omits optional flags" {
     try std.testing.expectEqualStrings("plink", argv[0]);
     try std.testing.expectEqualStrings("h", argv[4]);
     try std.testing.expectEqualStrings("'/x'", argv[5]);
+}
+
+test "scrubSshEnv drops only the inherited Win32-OpenSSH fd state" {
+    var env = std.process.EnvMap.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "C:\\Windows\\system32");
+    try env.put("SSH_CONNECTION", "192.0.2.1 50000 192.0.2.2 22");
+    try env.put(win32_openssh_fd_state, "AAAAAAICAgA=");
+    try std.testing.expect(scrubSshEnv(&env));
+    try std.testing.expect(env.get(win32_openssh_fd_state) == null);
+    try std.testing.expectEqualStrings("C:\\Windows\\system32", env.get("PATH").?);
+    try std.testing.expect(env.get("SSH_CONNECTION") != null);
+    try std.testing.expectEqual(@as(std.process.EnvMap.Size, 2), env.count());
+    // Desktop session: nothing to drop.
+    try std.testing.expect(!scrubSshEnv(&env));
+    try std.testing.expectEqual(@as(std.process.EnvMap.Size, 2), env.count());
 }
 
 test "shQuote round trips odd bytes" {

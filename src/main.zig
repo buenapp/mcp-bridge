@@ -637,7 +637,16 @@ pub const Bridge = struct {
         child.* = std.process.Child.init(argv, self.alloc);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit; // ssh's diagnostics reach the IDE log
+        var env: ?std.process.EnvMap = null; // Windows; read by spawn()
+        defer if (env) |*e| e.deinit();
         if (platform.is_windows) {
+            // An fd-state variable inherited from an sshd session describes
+            // handles other than the ones we pass (stdiofwd.win32_openssh_fd_state).
+            env = try std.process.getEnvMap(self.alloc);
+            if (stdiofwd.scrubSshEnv(&env.?))
+                ulog.vprint("mcp-bridge: forward: dropped inherited {s} from the ssh environment\n", .{stdiofwd.win32_openssh_fd_state});
+            child.env_map = &env.?;
+
             // Child cannot be handed a stdin handle, and its own synchronous
             // stdin pipe is one Win32-OpenSSH never reads. `.Inherit` makes
             // Child pass STD_INPUT_HANDLE, so swap our overlapped pipe in
